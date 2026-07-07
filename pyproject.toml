@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alftrade"
+version = "0.1.0"
+description = "A-share low-frequency cross-sectional trading system (daily max signal frequency)"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.setuptools]
+packages = ["alftrade"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
