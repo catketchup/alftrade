@@ -112,7 +112,7 @@ def test_universe_symbols_and_dates():
 
 def test_simulator_basic_shape():
     """Simulator produces a rectangular panel: every date has all symbols."""
-    bars, uni = generate_simulated_market(n_stocks=10, n_days=60, seed=1)
+    bars, uni, _ = generate_simulated_market(n_stocks=10, n_days=60, seed=1)
     dates = sorted(bars)
     syms = uni.symbols
     assert len(dates) == 60
@@ -123,7 +123,7 @@ def test_simulator_basic_shape():
 
 def test_simulator_prices_positive_and_within_limits():
     """All closes are positive and within the ±10% band of the prev close."""
-    bars, _ = generate_simulated_market(n_stocks=10, n_days=80, seed=2)
+    bars, _, _ = generate_simulated_market(n_stocks=10, n_days=80, seed=2)
     dates = sorted(bars)
     for d in dates[1:]:
         for bar in bars[d].values():
@@ -135,8 +135,8 @@ def test_simulator_prices_positive_and_within_limits():
 
 def test_simulator_reproducible():
     """Same seed → identical panel."""
-    b1, _ = generate_simulated_market(n_stocks=5, n_days=40, seed=99)
-    b2, _ = generate_simulated_market(n_stocks=5, n_days=40, seed=99)
+    b1, _, _ = generate_simulated_market(n_stocks=5, n_days=40, seed=99)
+    b2, _, _ = generate_simulated_market(n_stocks=5, n_days=40, seed=99)
     d = sorted(b1)[0]
     assert b1[d].keys() == b2[d].keys()
     for sym in b1[d]:

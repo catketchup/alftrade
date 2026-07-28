@@ -28,11 +28,11 @@ def _bar(date, close, prev_close, open_=None, high=None, low=None,
 # ── FactorCalculator basics ────────────────────────────────────────────
 
 def test_factor_names_canonical():
-    """FACTOR_NAMES has the 10 expected factors in order."""
+    """FACTOR_NAMES has the 11 expected factors in order."""
     assert FACTOR_NAMES == [
         "daily_return", "overnight_return", "intraday_return",
         "momentum_5d", "momentum_20d", "ma_dev_20", "volatility_20d",
-        "volume_ratio", "rsi_14", "atr_pct_14",
+        "volume_ratio", "rsi_14", "atr_pct_14", "market_beta",
     ]
 
 
@@ -188,6 +188,39 @@ def test_compute_cross_section_returns_per_symbol():
     assert out["B"]["daily_return"] == pytest.approx((200.0 - 198.0) / 198.0)
     # Calculators are stored for reuse across dates.
     assert set(calcs.keys()) == {"A", "B"}
+
+
+# ── market_beta factor ──────────────────────────────────────────────
+
+def test_market_beta_defaults_to_neutral():
+    """With no market returns, market_beta stays at 1.0 (neutral)."""
+    calc = FactorCalculator()
+    # Feed several bars with market_return=0.
+    prev = 100.0
+    for i in range(30):
+        # _bar helper doesn't set market_return; it defaults to 0.
+        f = calc.update(_bar(i + 1, close=100.0 + i * 0.1, prev_close=prev))
+        prev = 100.0 + i * 0.1
+    # When market_return is always 0, cov=0 → beta=1.0 (fallback).
+    assert f["market_beta"] == 1.0
+
+
+def test_market_beta_recovers_known_loading():
+    """When daily_return = 0.5 × market_return + noise, beta ≈ 0.5."""
+    calc = FactorCalculator(beta_window=30)
+    prev = 100.0
+    for i in range(40):
+        mkt = (i % 3 - 1) * 0.01  # alternating market
+        # stock return = 1.2 × mkt + noise → true beta = 1.2
+        noise = (i % 7 - 3) * 0.002
+        ret = 1.2 * mkt + noise
+        close = prev * (1.0 + ret)
+        bar = _bar(i + 1, close=close, prev_close=prev)
+        bar.market_return = mkt
+        f = calc.update(bar)
+        prev = close
+    # After 40 bars with 30-day window, beta should be ~1.2.
+    assert 0.8 <= f["market_beta"] <= 1.6
 
 
 def test_compute_cross_section_creates_missing_calculator():

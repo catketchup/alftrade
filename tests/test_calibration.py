@@ -39,7 +39,7 @@ def test_forward_return_zero_close():
 
 def test_calibrator_not_ready_with_little_data(market):
     """With too few samples, ready is False and fit raises."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=10_000, min_dates=10_000)
@@ -52,7 +52,7 @@ def test_calibrator_not_ready_with_little_data(market):
 
 def test_fit_returns_calibration_result(market):
     """fit() on enough data returns a populated CalibrationResult."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -70,7 +70,7 @@ def test_fit_returns_calibration_result(market):
 
 def test_fit_fama_macbeth_has_t_stats(market):
     """FM fit produces finite t-stats and p-values in [0, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -85,7 +85,7 @@ def test_fit_fama_macbeth_has_t_stats(market):
 
 def test_fit_pooled_has_no_t_stats(market):
     """Pooled fit leaves FM t-stats as NaN."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -100,7 +100,7 @@ def test_fit_pooled_has_no_t_stats(market):
 def test_fit_recovers_loaded_factor_sign(market):
     """The simulator's strongest loaded factor (volatility, β<0) is
     recovered with the correct sign and high significance."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -115,7 +115,7 @@ def test_fit_recovers_loaded_factor_sign(market):
 
 def test_larger_alpha_shrinks_betas(market):
     """A larger Ridge alpha shrinks β toward zero (regularization)."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
 
     def fit_with(alpha):
@@ -133,7 +133,7 @@ def test_larger_alpha_shrinks_betas(market):
 
 def test_num_samples_and_dates_grow(market):
     """collect() increases num_samples and num_dates over time."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -158,7 +158,7 @@ def test_reset_clears_data():
 
 def test_save_load_roundtrip(market, tmp_path):
     """save() then load() restores every field exactly."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -179,7 +179,7 @@ def test_save_load_roundtrip(market, tmp_path):
 
 def test_save_produces_valid_json(market, tmp_path):
     """The saved file is parseable JSON with the expected top-level keys."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)

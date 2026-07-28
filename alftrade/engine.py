@@ -99,6 +99,7 @@ class CrossSection:
 def standardize_cross_section(
     factors_by_symbol: dict[str, dict[str, float]],
     factor_names: list[str],
+    neutralize: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Z-score each factor across the day's universe of stocks.
 
@@ -109,6 +110,11 @@ def standardize_cross_section(
     This must be applied identically in ``FactorCalibrator.fit`` (offline)
     and in ``TradingEngine._calibrated_signals`` (online) so β is applied to
     the same factor representation in both phases.
+
+    If ``neutralize`` is provided (e.g. ["market_beta"]), each target factor
+    is residualised against the neutralise factors *before* z-scoring.  This
+    strips out the component of a factor that can be explained by the
+    neutralise variables — classic market / industry / size neutralisation.
     """
     symbols = list(factors_by_symbol.keys())
     n, k = len(symbols), len(factor_names)
@@ -117,6 +123,24 @@ def standardize_cross_section(
         f = factors_by_symbol[sym]
         for j, name in enumerate(factor_names):
             X[i, j] = f.get(name, 0.0)
+
+    # ── Optional neutralisation ──
+    if neutralize:
+        neut_cols = [factor_names.index(n) for n in neutralize if n in factor_names]
+        if neut_cols:
+            X_neut = X[:, neut_cols]
+            n_neut = len(neut_cols)
+            for j in range(k):
+                if j in neut_cols:
+                    continue
+                y = X[:, j]
+                # Ridge L2 (tiny α = 1e-6) avoids singularity when neut cols
+                # are collinear; equivalent to OLS for well-conditioned data.
+                XtX = X_neut.T @ X_neut
+                Xty = X_neut.T @ y
+                coeff = np.linalg.solve(XtX + 1e-6 * np.eye(n_neut), Xty)
+                X[:, j] = y - X_neut @ coeff
+
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     sd_safe = np.where(sd > 1e-12, sd, 1.0)
@@ -132,13 +156,19 @@ class TradingEngine:
     with that day's ``{symbol: DailyBar}`` map.
 
     Args:
-        factor_names: Ordered factors to use. Defaults to all 10 in
+        factor_names: Ordered factors to use. Defaults to all in
             ``FACTOR_NAMES``. Calibration β and these names must match.
         calibration: Optional ``CalibrationResult`` for calibrated mode.
         raw_thresholds: Per-factor threshold rules for raw mode. If a factor
             is absent from this dict, its raw-mode rule is skipped.
             Example: ``{"momentum_5d": 0.02}`` emits a LONG signal when
             momentum_5d > 0.02 and a FLAT signal when < -0.02.
+        neutralize: Optional list of factor names to neutralise *before*
+            z-scoring (e.g. ``["market_beta"]``). Each target factor is
+            residualised against the neutralise factors, stripping out
+            the cross-sectional relationship. Applied identically in both
+            ``build_cross_section`` (offline calibration) and
+            ``_calibrated_signals`` (online inference).
     """
 
     def __init__(
@@ -146,6 +176,7 @@ class TradingEngine:
         factor_names: Optional[list[str]] = None,
         calibration: "Optional[CalibrationResult]" = None,
         raw_thresholds: Optional[dict[str, float]] = None,
+        neutralize: Optional[list[str]] = None,
     ):
         self.factor_names = list(factor_names or FACTOR_NAMES)
         self.calibration = calibration
@@ -155,6 +186,7 @@ class TradingEngine:
             "rsi_14": 0.30,        # rsi is on [-1,1] scale after rescaling
             "ma_dev_20": 0.02,
         }
+        self.neutralize = neutralize
         self._calcs: dict[str, FactorCalculator] = {}
 
     def on_cross_section(self, date: int, bars: dict[str, DailyBar]) -> dict[str, list[Signal]]:
@@ -180,7 +212,8 @@ class TradingEngine:
         """
         tradeable = {s: b for s, b in bars.items() if not b.is_suspended}
         factors_by_symbol = compute_cross_section(tradeable, self._calcs)
-        Z, symbols = standardize_cross_section(factors_by_symbol, self.factor_names)
+        Z, symbols = standardize_cross_section(
+            factors_by_symbol, self.factor_names, neutralize=self.neutralize)
         return CrossSection(
             date=date,
             bars=tradeable,
@@ -226,7 +259,8 @@ class TradingEngine:
         from alftrade.calibration import CalibrationResult
 
         cal: CalibrationResult = self.calibration
-        Z, symbols = standardize_cross_section(factors_by_symbol, self.factor_names)
+        Z, symbols = standardize_cross_section(
+            factors_by_symbol, self.factor_names, neutralize=self.neutralize)
         betas = np.array([cal.betas.get(name, 0.0) for name in self.factor_names])
         pred = Z @ betas
 

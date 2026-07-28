@@ -14,15 +14,15 @@ from alftrade import generate_simulated_market, TradingEngine, FactorCalibrator
 @pytest.fixture(scope="session")
 def market():
     """A 20-stock × 150-day simulated A-share panel."""
-    bars_by_date, universe = generate_simulated_market(
+    bars_by_date, universe, market_returns = generate_simulated_market(
         n_stocks=20, n_days=150, seed=11
     )
-    return bars_by_date, universe
+    return bars_by_date, universe, market_returns
 
 
 @pytest.fixture(scope="session")
 def dates(market):
-    bars_by_date, _ = market
+    bars_by_date, _, _ = market
     return sorted(bars_by_date)
 
 

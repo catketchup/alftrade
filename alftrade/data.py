@@ -72,6 +72,7 @@ class DailyBar:
     limit_down_price: float = 0.0
     is_suspended: bool = False
     total_shares: float = 0.0
+    market_return: float = 0.0
 
     @property
     def mid_price(self) -> float:
@@ -213,9 +214,10 @@ def generate_simulated_market(
             the factor-driven regime begins.
 
     Returns:
-        (bars_by_date, universe) where
+        (bars_by_date, universe, market_returns) where
             bars_by_date[date] = {symbol: DailyBar}
             universe.active_on(date) = set of symbols with a bar on that date.
+            market_returns[date] = daily market index return (common to all stocks).
     """
     if n_stocks < 2:
         raise ValueError("Need at least 2 stocks for a cross-sectional market.")
@@ -237,6 +239,14 @@ def generate_simulated_market(
     base_volume = rng.uniform(5e5, 3e6, size=n_stocks)    # shares/day
     total_shares = rng.uniform(5e8, 3e9, size=n_stocks)   # shares outstanding
     vol_noise_scale = rng.uniform(0.008, 0.020, size=n_stocks)  # idio vol
+
+    # ── Market (index) return & per-stock CAPM beta ──
+    # A hidden common factor drives all stocks to varying degrees, producing
+    # realistic cross-sectional correlation and creating a genuine market-beta
+    # factor that the calibrator can recover.
+    market_returns_arr: np.ndarray = rng.normal(0.0002, 0.005, size=n_days)
+    stock_market_betas: np.ndarray = rng.uniform(0.5, 1.5, size=n_stocks)
+    market_returns: dict[int, float] = {}
 
     # Price and volume history matrices: shape (T, N).
     close = np.zeros((n_days, n_stocks))
@@ -270,13 +280,13 @@ def generate_simulated_market(
 
     for t in range(n_days):
         prev_close = close[t - 1] if t > 0 else base_price
+        mkt_ret = market_returns_arr[t]
 
         if t < burn_in:
             # Pure-noise regime so rolling windows fill up.
-            ret = alpha + rng.normal(0, 1, n_stocks) * vol_noise_scale
+            ret = alpha + stock_market_betas * mkt_ret + rng.normal(0, 1, n_stocks) * vol_noise_scale
         else:
             # Factor-driven regime: use factors computed from prices[:t]
-            # (i.e. the calculator state after ingesting bar t-1).
             factor_mat = np.zeros((n_stocks, len(loadings)))
             factor_names = list(loadings.keys())
             for i in range(n_stocks):
@@ -290,7 +300,7 @@ def generate_simulated_market(
             z = (factor_mat - mu) / sd_safe
             betas = np.array([loadings[n] for n in factor_names])
             pred = z @ betas
-            ret = alpha + pred + rng.normal(0, 1, n_stocks) * vol_noise_scale
+            ret = alpha + pred + stock_market_betas * mkt_ret + rng.normal(0, 1, n_stocks) * vol_noise_scale
 
         # Clip returns to the daily price-limit band so prices stay tradeable.
         ret = np.clip(ret, -limit_pct * 0.995, limit_pct * 0.995)
@@ -328,11 +338,13 @@ def generate_simulated_market(
                 limit_down_price=float(lim_dn),
                 is_suspended=False,
                 total_shares=float(total_shares[i]),
+                market_return=float(mkt_ret),
             )
             day_bars[sym] = bar
             calcs[i].update(bar)
 
         bars_by_date[date] = day_bars
         universe.add(date, symbols)
+        market_returns[date] = float(mkt_ret)
 
-    return bars_by_date, universe
+    return bars_by_date, universe, market_returns

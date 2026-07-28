@@ -60,6 +60,7 @@ FACTOR_NAMES: list[str] = [
     "volume_ratio",
     "rsi_14",
     "atr_pct_14",
+    "market_beta",
 ]
 
 
@@ -85,6 +86,7 @@ class FactorCalculator:
         vol_window: Volatility lookback in trading days (default 20).
         rsi_window: RSI lookback (default 14).
         atr_window: ATR lookback (default 14).
+        beta_window: Rolling window for market-beta estimation (default 60).
     """
 
     def __init__(
@@ -93,15 +95,18 @@ class FactorCalculator:
         vol_window: int = 20,
         rsi_window: int = 14,
         atr_window: int = 14,
+        beta_window: int = 60,
     ):
         self.sma_window = sma_window
         self.vol_window = vol_window
         self.rsi_window = rsi_window
         self.atr_window = atr_window
+        self.beta_window = beta_window
 
         self._closes: deque[float] = deque(maxlen=max(sma_window, 20) + 1)
         self._returns: deque[float] = deque(maxlen=vol_window)
         self._volumes: deque[float] = deque(maxlen=sma_window)
+        self._beta_returns: deque[float] = deque(maxlen=beta_window)
         # RSI uses Wilder smoothing: track avg gain / avg loss.
         self._avg_gain: Optional[float] = None
         self._avg_loss: Optional[float] = None
@@ -111,6 +116,8 @@ class FactorCalculator:
         self._tr_sum: float = 0.0
         self._atr: Optional[float] = None
         self._atr_count: int = 0
+        # Market beta via rolling window regression of stock returns on market returns.
+        self._market_returns: deque[float] = deque(maxlen=beta_window)
 
         self._latest: dict[str, float] = {name: 0.0 for name in FACTOR_NAMES}
 
@@ -149,6 +156,7 @@ class FactorCalculator:
 
         # ── Volatility: rolling std of daily returns ──
         self._returns.append(daily_return)
+        self._beta_returns.append(daily_return)
         volatility_20d = self._rolling_std(self._returns)
 
         # ── Volume ratio ──
@@ -163,6 +171,10 @@ class FactorCalculator:
         atr = self._update_atr(bar)
         atr_pct_14 = _safe_div(atr, close)
 
+        # ── Market β: rolling-window OLS beta of stock returns on market returns ──
+        self._market_returns.append(bar.market_return)
+        market_beta = self._compute_market_beta()
+
         self._latest = {
             "daily_return": daily_return,
             "overnight_return": overnight_return,
@@ -174,6 +186,7 @@ class FactorCalculator:
             "volume_ratio": volume_ratio,
             "rsi_14": rsi_14,
             "atr_pct_14": atr_pct_14,
+            "market_beta": market_beta,
         }
         return dict(self._latest)
 
@@ -272,11 +285,30 @@ class FactorCalculator:
         self._atr = (self._atr * (w - 1) + tr) / w
         return self._atr
 
+    def _compute_market_beta(self) -> float:
+        """Rolling OLS β of stock returns on market returns.
+
+        Uses the shorter of ``_beta_returns`` and ``_market_returns`` lengths.
+        Falls back to 1.0 (neutral beta) when there aren't enough points.
+        """
+        n = min(len(self._beta_returns), len(self._market_returns))
+        if n < 12:
+            return 1.0
+        r_s = list(self._beta_returns)[-n:]
+        r_m = list(self._market_returns)[-n:]
+        mean_s = sum(r_s) / n
+        mean_m = sum(r_m) / n
+        cov = sum((a - mean_s) * (b - mean_m) for a, b in zip(r_s, r_m)) / n
+        var = sum((b - mean_m) ** 2 for b in r_m) / n
+        return _safe_div(cov, var, fallback=1.0)
+
     def reset(self) -> None:
         """Clear all rolling state (e.g. before reusing on a new symbol)."""
         self._closes.clear()
         self._returns.clear()
         self._volumes.clear()
+        self._market_returns.clear()
+        self._beta_returns.clear()
         self._avg_gain = None
         self._avg_loss = None
         self._rsi_count = 0

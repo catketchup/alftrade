@@ -33,6 +33,7 @@ from alftrade.portfolio import (
 from alftrade.risk import RiskManager, RiskConfig
 from alftrade.calibration import CalibrationResult, FactorCalibrator
 from alftrade.profiler import FactorProfile, ModelProfile, FactorProfiler
+from alftrade.hedge import HedgeManager, FuturesContract, compute_hedged_equity
 
 __all__ = [
     "DailyBar",
@@ -56,4 +57,7 @@ __all__ = [
     "FactorProfile",
     "ModelProfile",
     "FactorProfiler",
+    "HedgeManager",
+    "FuturesContract",
+    "compute_hedged_equity",
 ]

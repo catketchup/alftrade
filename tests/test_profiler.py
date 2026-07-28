@@ -13,7 +13,7 @@ from alftrade.profiler import FactorProfile, ModelProfile, FactorProfiler
 
 def test_profile_returns_model_profile(market):
     """profile() returns a ModelProfile with per-factor profiles."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -32,7 +32,7 @@ def test_profile_returns_model_profile(market):
 
 def test_profile_has_all_factors(market):
     """Every FACTOR_NAMES entry appears exactly once in factor_profiles."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -47,7 +47,7 @@ def test_profile_has_all_factors(market):
 
 def test_ic_in_valid_range(market):
     """Every per-factor IC lies in [-1, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -61,7 +61,7 @@ def test_ic_in_valid_range(market):
 
 def test_p_value_in_unit_interval(market):
     """p-values lie in [0, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -74,7 +74,7 @@ def test_p_value_in_unit_interval(market):
 
 def test_coverage_in_unit_interval(market):
     """Coverage is a fraction in [0, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -87,7 +87,7 @@ def test_coverage_in_unit_interval(market):
 
 def test_turnover_in_unit_interval(market):
     """Turnover (normalized rank change) lies in [0, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -100,7 +100,7 @@ def test_turnover_in_unit_interval(market):
 
 def test_quantile_returns_length(market):
     """quantile_returns has exactly n_quantiles entries."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -114,7 +114,7 @@ def test_quantile_returns_length(market):
 
 def test_monotonicity_in_valid_range(market):
     """Monotonicity (Spearman rho) lies in [-1, 1]."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -130,7 +130,7 @@ def test_monotonicity_in_valid_range(market):
 
 def test_strongest_factor_has_high_abs_ic(market):
     """volatility_20d (the simulator's strongest loaded factor) has |IC|>0.1."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -145,7 +145,7 @@ def test_strongest_factor_has_high_abs_ic(market):
 
 def test_model_monotonicity_positive(market):
     """Model predictions sort stocks in the right direction on average."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -160,7 +160,7 @@ def test_model_monotonicity_positive(market):
 
 def test_selected_factors_filters_by_p_value(market):
     """selected_factors returns only factors below the p-value threshold."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -177,7 +177,7 @@ def test_selected_factors_filters_by_p_value(market):
 
 def test_selected_factors_includes_strongest(market):
     """volatility_20d is significant and therefore selected at p<0.05."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
@@ -192,7 +192,7 @@ def test_selected_factors_includes_strongest(market):
 
 def test_model_profile_repr_lists_factors(market):
     """repr lists every factor and the significance legend."""
-    bars, _ = market
+    bars, _, _ = market
     dates = sorted(bars)
     engine = TradingEngine()
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
