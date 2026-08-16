@@ -1,49 +1,40 @@
 """
-factors.py - Cross-sectional daily factor calculator.
+factors.py - Cross-sectional daily factor computation (polars-vectorized).
 
-This is the daily-frequency, pure-Python analogue of hftrade's C++
-``FactorCalculator``. Two key differences from the high-frequency version:
+This module computes all 11 daily factors in a single vectorized pass over a
+long-format ``polars.DataFrame`` — one row per (symbol, date).  This replaces
+the earlier per-stock ``deque`` rolling calculator with a batch, group-by
+implementation that is idiomatic polars and scales to real A-share universes.
 
-  1. **No C++/Cython.** Daily frequency means we process at most one bar per
-     stock per day; numpy rolling windows are more than fast enough and the
-     build stays a pure-Python ``pip install``.
+Design notes:
+  * Every factor is expressed as a ``pl.Expr`` with ``.over("symbol")`` so that
+    rolling / shift / ewm windows are computed within each stock's time series.
+  * Division is guarded with ``when(den.abs() > eps).then(num/den).otherwise(fb)``
+    because polars yields ``inf`` for ``x/0`` and ``NaN`` for ``0/0`` (verified).
+  * Warm-up NaNs are filled: ``0.0`` for every factor except ``market_beta``,
+    which falls back to ``1.0`` (neutral beta) — matching the previous
+    calculator's "0 until enough history" convention.
 
-  2. **All factors are already stationary.** hftrade had to transform raw
-     price levels (mid_price ~100, vwap ~100) into stationary ratios before
-     regressing them against returns. Here every factor is *defined* as a
-     return, ratio, or bounded indicator, so there is no stationarity
-     transform inside the calculator itself. Cross-sectional standardization
-     (z-scoring within each date's universe) happens later, in
-     ``calibration.transform_factors``, because it requires the whole
-     cross-section — not a single stock.
-
-Factor list (10 factors, all computable from OHLCV):
+Factor list (11, all computable from OHLCV + prev_close + market_return):
     daily_return      = (close - prev_close) / prev_close
     overnight_return  = (open  - prev_close) / prev_close
     intraday_return   = (close - open)       / open
     momentum_5d       = (close - close[t-5])  / close[t-5]
     momentum_20d      = (close - close[t-20]) / close[t-20]
     ma_dev_20         = (close - SMA20)       / SMA20
-    volatility_20d    = std(daily_return, 20)
+    volatility_20d    = std(daily_return, 20)  (population, ddof=0)
     volume_ratio      = volume / SMA20(volume)
-    rsi_14            = RSI(14) on close, in [0, 100] (rescaled to [-1, 1])
-    atr_pct_14        = ATR(14) / close
+    rsi_14            = Wilder RSI(14), rescaled to [-1, 1]
+    atr_pct_14        = Wilder ATR(14) / close
+    market_beta       = rolling OLS beta of daily_return on market_return (60d)
 
 Usage:
-    calc = FactorCalculator()
-    for bar in bars_for_one_symbol:
-        factors = calc.update(bar)   # advances rolling state, returns latest
-    # or: calc.latest_factors  -> dict of the most recent factor values
-
-The calculator keeps per-stock rolling state (price/volume windows, running
-returns). Create **one instance per symbol**, exactly like hftrade's
-``FactorCalculator(sma_window)`` was one per instrument.
+    df = pl.DataFrame(...)                 # long table, one row per (symbol, date)
+    factors = compute_factor_panel(df)     # [date, symbol, + 11 factor columns]
+    by_date = factor_panel_to_dict(factors) # {date: {symbol: {factor: value}}}
 """
 
-from collections import deque
-from typing import Optional
-
-from alftrade.data import DailyBar
+import polars as pl
 
 
 # Ordered factor names — the canonical ordering used everywhere in the system
@@ -64,284 +55,148 @@ FACTOR_NAMES: list[str] = [
 ]
 
 
-def _safe_div(num: float, den: float, fallback: float = 0.0) -> float:
-    """Division that returns `fallback` when the divisor is ~0."""
-    return num / den if abs(den) > 1e-12 else fallback
+def _sdiv(num: pl.Expr, den: pl.Expr, fallback: float = 0.0) -> pl.Expr:
+    """Safe division: returns ``fallback`` when the divisor is ~0 or null."""
+    return pl.when(den.abs() > 1e-12).then(num / den).otherwise(fallback)
 
 
-class FactorCalculator:
-    """Per-symbol rolling daily factor calculator.
-
-    Maintains:
-      * a ring buffer of recent closes (for momentum / SMA / RSI),
-      * a ring buffer of recent daily returns (for volatility),
-      * a ring buffer of recent volumes (for volume_ratio),
-      * running True Range accumulators (for ATR).
-
-    All factors are O(1) amortized per bar thanks to the deque sliding
-    windows — the same design hftrade's C++ calculator used for SMA/VWAP.
+def compute_factor_panel(
+    df: pl.DataFrame,
+    sma_window: int = 20,
+    vol_window: int = 20,
+    rsi_window: int = 14,
+    atr_window: int = 14,
+    beta_window: int = 60,
+    beta_min_samples: int = 12,
+) -> pl.DataFrame:
+    """Compute all factors for a long-format panel in one vectorized pass.
 
     Args:
-        sma_window: SMA lookback in trading days (default 20).
-        vol_window: Volatility lookback in trading days (default 20).
+        df: Long table with columns ``date, symbol, open, high, low, close,
+            volume, prev_close, market_return`` (extra columns are ignored).
+        sma_window: SMA lookback (default 20).
+        vol_window: Volatility lookback (default 20).
         rsi_window: RSI lookback (default 14).
         atr_window: ATR lookback (default 14).
-        beta_window: Rolling window for market-beta estimation (default 60).
-    """
-
-    def __init__(
-        self,
-        sma_window: int = 20,
-        vol_window: int = 20,
-        rsi_window: int = 14,
-        atr_window: int = 14,
-        beta_window: int = 60,
-    ):
-        self.sma_window = sma_window
-        self.vol_window = vol_window
-        self.rsi_window = rsi_window
-        self.atr_window = atr_window
-        self.beta_window = beta_window
-
-        self._closes: deque[float] = deque(maxlen=max(sma_window, 20) + 1)
-        self._returns: deque[float] = deque(maxlen=vol_window)
-        self._volumes: deque[float] = deque(maxlen=sma_window)
-        self._beta_returns: deque[float] = deque(maxlen=beta_window)
-        # RSI uses Wilder smoothing: track avg gain / avg loss.
-        self._avg_gain: Optional[float] = None
-        self._avg_loss: Optional[float] = None
-        self._rsi_count: int = 0
-        self._prev_close: Optional[float] = None
-        # ATR via Wilder smoothing of True Range.
-        self._tr_sum: float = 0.0
-        self._atr: Optional[float] = None
-        self._atr_count: int = 0
-        # Market beta via rolling window regression of stock returns on market returns.
-        self._market_returns: deque[float] = deque(maxlen=beta_window)
-
-        self._latest: dict[str, float] = {name: 0.0 for name in FACTOR_NAMES}
-
-    @property
-    def latest_factors(self) -> dict[str, float]:
-        """Most recent factor values as a dict (0.0 until enough history)."""
-        return dict(self._latest)
-
-    def update(self, bar: DailyBar) -> dict[str, float]:
-        """Ingest one daily bar and return the updated factor dict.
-
-        This both advances the rolling state and returns the latest factors,
-        so callers can write ``factors = calc.update(bar)`` in a single
-        expression. Mirrors hftrade's ``PyFactorCalculator.compute(...)`` but
-        takes a ``DailyBar`` instead of scalar tick fields.
-        """
-        close = bar.close
-        prev_close = bar.prev_close if bar.prev_close > 0 else (
-            self._closes[-1] if len(self._closes) >= 1 else close
-        )
-
-        # ── Price-based factors ──
-        daily_return = _safe_div(close - prev_close, prev_close)
-        overnight_return = _safe_div(bar.open - prev_close, prev_close)
-        intraday_return = _safe_div(close - bar.open, bar.open)
-
-        self._closes.append(close)
-        self._volumes.append(bar.volume)
-
-        sma = (sum(self._closes) / len(self._closes)) if self._closes else close
-        ma_dev_20 = _safe_div(close - sma, sma)
-
-        # Momentum: need closes from 5 / 20 bars ago.
-        momentum_5d = self._momentum(5)
-        momentum_20d = self._momentum(20)
-
-        # ── Volatility: rolling std of daily returns ──
-        self._returns.append(daily_return)
-        self._beta_returns.append(daily_return)
-        volatility_20d = self._rolling_std(self._returns)
-
-        # ── Volume ratio ──
-        vol_sma = (sum(self._volumes) / len(self._volumes)) if self._volumes else bar.volume
-        volume_ratio = _safe_div(bar.volume, vol_sma, 1.0)
-
-        # ── RSI(14) via Wilder smoothing, rescaled to [-1, 1] ──
-        rsi_raw = self._update_rsi(daily_return)
-        rsi_14 = (rsi_raw - 50.0) / 50.0  # 0..100 -> -1..+1
-
-        # ── ATR(14) as a fraction of close ──
-        atr = self._update_atr(bar)
-        atr_pct_14 = _safe_div(atr, close)
-
-        # ── Market β: rolling-window OLS beta of stock returns on market returns ──
-        self._market_returns.append(bar.market_return)
-        market_beta = self._compute_market_beta()
-
-        self._latest = {
-            "daily_return": daily_return,
-            "overnight_return": overnight_return,
-            "intraday_return": intraday_return,
-            "momentum_5d": momentum_5d,
-            "momentum_20d": momentum_20d,
-            "ma_dev_20": ma_dev_20,
-            "volatility_20d": volatility_20d,
-            "volume_ratio": volume_ratio,
-            "rsi_14": rsi_14,
-            "atr_pct_14": atr_pct_14,
-            "market_beta": market_beta,
-        }
-        return dict(self._latest)
-
-    # ── Rolling-helpers ─────────────────────────────────────────────
-
-    def _momentum(self, n: int) -> float:
-        """Return (close - close[t-n]) / close[t-n], or 0 if not enough history."""
-        if len(self._closes) <= n:
-            return 0.0
-        old = self._closes[-(n + 1)]
-        return _safe_div(self._closes[-1] - old, old)
-
-    @staticmethod
-    def _rolling_std(values: deque) -> float:
-        """Population std of the deque's contents (0 if < 2 points)."""
-        n = len(values)
-        if n < 2:
-            return 0.0
-        mean = sum(values) / n
-        var = sum((v - mean) ** 2 for v in values) / n
-        return var ** 0.5
-
-    def _update_rsi(self, change: float) -> float:
-        """Advance Wilder RSI state and return RSI in [0, 100].
-
-        Wilder smoothing:
-          First rsi_window changes: simple averages of gains/losses.
-          Thereafter: avg = (prev_avg * (n-1) + current) / n.
-        Returns 50.0 (neutral) until enough history has accumulated.
-
-        During the bootstrap window (calls 1..w), ``_avg_gain`` / ``_avg_loss``
-        are used as running *sums*; at call w they are divided by w to become
-        averages, after which Wilder smoothing takes over.
-        """
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
-        w = self.rsi_window
-
-        if self._avg_gain is None:
-            # First change: start the running sums.
-            self._avg_gain = gain
-            self._avg_loss = loss
-            self._rsi_count = 1
-            return 50.0
-        self._rsi_count += 1
-        if self._rsi_count <= w:
-            # Still bootstrapping: accumulate running sums.
-            self._avg_gain += gain
-            self._avg_loss += loss
-            if self._rsi_count == w:
-                self._avg_gain /= w
-                self._avg_loss /= w
-            return 50.0
-        # Wilder smoothing after bootstrap.
-        self._avg_gain = (self._avg_gain * (w - 1) + gain) / w
-        self._avg_loss = (self._avg_loss * (w - 1) + loss) / w
-        if self._avg_loss < 1e-12:
-            return 100.0
-        rs = self._avg_gain / self._avg_loss
-        return 100.0 - 100.0 / (1.0 + rs)
-
-    def _update_atr(self, bar: DailyBar) -> float:
-        """Advance Wilder ATR state and return the current ATR value.
-
-        True Range = max(
-            high - low,
-            |high - prev_close|,
-            |low  - prev_close|
-        )
-        Bootstrap: average of first `atr_window` TRs.
-        Thereafter: ATR = (prev_ATR * (n-1) + TR) / n.
-        Returns 0.0 until the first bar is seen.
-        """
-        prev_close = bar.prev_close if bar.prev_close > 0 else (
-            self._closes[-2] if len(self._closes) >= 2 else bar.close
-        )
-        tr = max(
-            bar.high - bar.low,
-            abs(bar.high - prev_close),
-            abs(bar.low - prev_close),
-        )
-        w = self.atr_window
-        self._atr_count += 1
-        if self._atr is None:
-            self._tr_sum = tr
-            self._atr = tr
-            return tr
-        if self._atr_count <= w:
-            self._tr_sum += tr
-            if self._atr_count == w:
-                self._atr = self._tr_sum / w
-            else:
-                self._atr = self._tr_sum / self._atr_count  # provisional avg
-            return self._atr
-        # Wilder smoothing.
-        self._atr = (self._atr * (w - 1) + tr) / w
-        return self._atr
-
-    def _compute_market_beta(self) -> float:
-        """Rolling OLS β of stock returns on market returns.
-
-        Uses the shorter of ``_beta_returns`` and ``_market_returns`` lengths.
-        Falls back to 1.0 (neutral beta) when there aren't enough points.
-        """
-        n = min(len(self._beta_returns), len(self._market_returns))
-        if n < 12:
-            return 1.0
-        r_s = list(self._beta_returns)[-n:]
-        r_m = list(self._market_returns)[-n:]
-        mean_s = sum(r_s) / n
-        mean_m = sum(r_m) / n
-        cov = sum((a - mean_s) * (b - mean_m) for a, b in zip(r_s, r_m)) / n
-        var = sum((b - mean_m) ** 2 for b in r_m) / n
-        return _safe_div(cov, var, fallback=1.0)
-
-    def reset(self) -> None:
-        """Clear all rolling state (e.g. before reusing on a new symbol)."""
-        self._closes.clear()
-        self._returns.clear()
-        self._volumes.clear()
-        self._market_returns.clear()
-        self._beta_returns.clear()
-        self._avg_gain = None
-        self._avg_loss = None
-        self._rsi_count = 0
-        self._prev_close = None
-        self._tr_sum = 0.0
-        self._atr = None
-        self._atr_count = 0
-        self._latest = {name: 0.0 for name in FACTOR_NAMES}
-
-
-def compute_cross_section(
-    bars: dict[str, DailyBar],
-    calcs: dict[str, FactorCalculator],
-) -> dict[str, dict[str, float]]:
-    """Feed one day's bars into per-symbol calculators; return {sym: factors}.
-
-    Convenience wrapper used by the engine. ``calcs`` must contain a
-    ``FactorCalculator`` for every symbol in ``bars``; each calculator is
-    advanced with that symbol's bar.
-
-    Args:
-        bars: {symbol: DailyBar} for a single trading date.
-        calcs: {symbol: FactorCalculator} with one calculator per symbol,
-               reused across dates (so rolling state persists day to day).
+        beta_window: Market-beta rolling window (default 60).
+        beta_min_samples: Minimum points for the beta regression (default 12).
 
     Returns:
-        {symbol: {factor_name: value}} — the latest factors per symbol.
+        A ``polars.DataFrame`` with columns ``[date, symbol] + FACTOR_NAMES``,
+        sorted by ``(symbol, date)``, with warm-up NaNs filled (0.0, or 1.0
+        for market_beta).
     """
-    out: dict[str, dict[str, float]] = {}
-    for sym, bar in bars.items():
-        calc = calcs.get(sym)
-        if calc is None:
-            calc = FactorCalculator()
-            calcs[sym] = calc
-        out[sym] = calc.update(bar)
-    return out
+    df = df.sort(["symbol", "date"])
+
+    # Materialize the per-symbol close diff once: RSI needs a *second* window
+    # (ewm) on top of the diff, and polars forbids nesting window expressions
+    # inside a window context.  By materialising `_delta` as a plain column
+    # first, the RSI ewm applies a single `.over("symbol")` to a plain column.
+    df = df.with_columns(
+        pl.col("close").diff().over("symbol").alias("_delta")
+    )
+
+    # ── Price-based factors ──
+    daily_return = _sdiv(pl.col("close") - pl.col("prev_close"), pl.col("prev_close"))
+    overnight_return = _sdiv(pl.col("open") - pl.col("prev_close"), pl.col("prev_close"))
+    intraday_return = _sdiv(pl.col("close") - pl.col("open"), pl.col("open"))
+
+    # Momentum via shifted close within each symbol.
+    momentum_5d = _sdiv(
+        pl.col("close") - pl.col("close").shift(5).over("symbol"),
+        pl.col("close").shift(5).over("symbol"),
+    )
+    momentum_20d = _sdiv(
+        pl.col("close") - pl.col("close").shift(20).over("symbol"),
+        pl.col("close").shift(20).over("symbol"),
+    )
+
+    # Deviation from the 20-day SMA.
+    sma20 = pl.col("close").rolling_mean(sma_window, min_samples=1).over("symbol")
+    ma_dev_20 = _sdiv(pl.col("close") - sma20, sma20)
+
+    # ── Volatility (population std of daily returns, ddof=0) ──
+    volatility_20d = daily_return.rolling_std(
+        vol_window, ddof=0, min_samples=2
+    ).over("symbol")
+
+    # ── Volume ratio ──
+    vol_sma = pl.col("volume").rolling_mean(sma_window, min_samples=1).over("symbol")
+    volume_ratio = _sdiv(pl.col("volume"), vol_sma, fallback=1.0)
+
+    # ── RSI via Wilder smoothing (EMA with alpha = 1/n), rescaled to [-1, 1] ──
+    # RSI = 100 * avg_gain / (avg_gain + avg_loss): pure up-trend → 100,
+    # pure down-trend → 0, warm-up (both ≈ 0) → 50 (neutral).
+    gain = pl.when(pl.col("_delta") > 0).then(pl.col("_delta")).otherwise(0.0)
+    loss = pl.when(pl.col("_delta") < 0).then(-pl.col("_delta")).otherwise(0.0)
+    avg_gain = gain.ewm_mean(alpha=1.0 / rsi_window, adjust=False, min_samples=1).over("symbol")
+    avg_loss = loss.ewm_mean(alpha=1.0 / rsi_window, adjust=False, min_samples=1).over("symbol")
+    sum_gain_loss = avg_gain + avg_loss
+    rsi_raw = pl.when(sum_gain_loss > 1e-12).then(
+        100.0 * avg_gain / sum_gain_loss
+    ).otherwise(50.0)
+    rsi_14 = (rsi_raw - 50.0) / 50.0
+
+    # ── ATR via Wilder smoothing of True Range, as a fraction of close ──
+    tr = pl.max_horizontal(
+        pl.col("high") - pl.col("low"),
+        (pl.col("high") - pl.col("prev_close")).abs(),
+        (pl.col("low") - pl.col("prev_close")).abs(),
+    )
+    atr = tr.ewm_mean(alpha=1.0 / atr_window, adjust=False, min_samples=1).over("symbol")
+    atr_pct_14 = _sdiv(atr, pl.col("close"))
+
+    # ── Market beta: rolling OLS beta via the covariance identity ──
+    # cov(x, y) = E[xy] - E[x]E[y];  var(y) = E[y^2] - E[y]^2   (population)
+    m = pl.col("market_return")
+    d = daily_return
+    dm = d * m
+    cov = (
+        dm.rolling_mean(beta_window, min_samples=beta_min_samples).over("symbol")
+        - d.rolling_mean(beta_window, min_samples=beta_min_samples).over("symbol")
+        * m.rolling_mean(beta_window, min_samples=beta_min_samples).over("symbol")
+    )
+    var = (
+        (m * m).rolling_mean(beta_window, min_samples=beta_min_samples).over("symbol")
+        - m.rolling_mean(beta_window, min_samples=beta_min_samples).over("symbol") ** 2
+    )
+    market_beta = _sdiv(cov, var, fallback=1.0)
+
+    out = df.with_columns([
+        daily_return.fill_null(0.0).alias("daily_return"),
+        overnight_return.fill_null(0.0).alias("overnight_return"),
+        intraday_return.fill_null(0.0).alias("intraday_return"),
+        momentum_5d.fill_null(0.0).alias("momentum_5d"),
+        momentum_20d.fill_null(0.0).alias("momentum_20d"),
+        ma_dev_20.fill_null(0.0).alias("ma_dev_20"),
+        volatility_20d.fill_null(0.0).alias("volatility_20d"),
+        volume_ratio.fill_null(1.0).alias("volume_ratio"),
+        rsi_14.fill_null(0.0).alias("rsi_14"),
+        atr_pct_14.fill_null(0.0).alias("atr_pct_14"),
+        market_beta.fill_null(1.0).alias("market_beta"),
+    ])
+    return out.select(["date", "symbol"] + FACTOR_NAMES)
+
+
+def factor_panel_to_dict(
+    factor_df: pl.DataFrame,
+) -> dict[int, dict[str, dict[str, float]]]:
+    """Convert a factor panel into ``{date: {symbol: {factor: value}}}``.
+
+    This is the shape the ``TradingEngine`` consumes, so the factor panel can
+    be precomputed once and looked up per date during the backtest.
+
+    Args:
+        factor_df: Output of ``compute_factor_panel`` (or an equivalent table
+            with columns ``date, symbol`` + ``FACTOR_NAMES``).
+
+    Returns:
+        Nested dict keyed by date then symbol then factor name.
+    """
+    result: dict[int, dict[str, dict[str, float]]] = {}
+    for (date,), grp in factor_df.group_by("date", maintain_order=True):
+        day: dict[str, dict[str, float]] = {}
+        for row in grp.iter_rows(named=True):
+            day[row["symbol"]] = {n: float(row[n]) for n in FACTOR_NAMES}
+        result[int(date)] = day
+    return result

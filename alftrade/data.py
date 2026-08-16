@@ -262,18 +262,9 @@ def generate_simulated_market(
     low[0] = np.minimum(openp[0], close[0]) * (1.0 - np.abs(rng.normal(0, 0.004, n_stocks)))
     volume[0] = base_volume * rng.lognormal(0, 0.3, n_stocks)
 
-    # Rolling buffers for factor computation (vectorized, see factors.py).
-    # We recompute factors on the fly from the price history built so far.
-    from alftrade.factors import FactorCalculator
-
-    calcs = [FactorCalculator() for _ in range(n_stocks)]
-
-    # Helper: compute the loaded factors for all stocks at day t-1, using
-    # each stock's FactorCalculator fed with bars up to t-1. We do this by
-    # streaming bars into each calculator as we build them.
-    # To keep the generator self-contained, we compute factors incrementally:
-    # after constructing bar[t-1], we feed it to each calc so that asking the
-    # calc for "latest factors" at the start of step t reflects t-1 data.
+    # The factor-driven regime needs at least 21 bars of history for the
+    # deepest lookback (20-day momentum). Effective burn-in covers both.
+    effective_burn_in = max(burn_in, 21)
 
     bars_by_date: dict[int, dict[str, DailyBar]] = {}
     universe = StockUniverse()
@@ -282,23 +273,19 @@ def generate_simulated_market(
         prev_close = close[t - 1] if t > 0 else base_price
         mkt_ret = market_returns_arr[t]
 
-        if t < burn_in:
+        if t < effective_burn_in:
             # Pure-noise regime so rolling windows fill up.
             ret = alpha + stock_market_betas * mkt_ret + rng.normal(0, 1, n_stocks) * vol_noise_scale
         else:
             # Factor-driven regime: use factors computed from prices[:t]
-            factor_mat = np.zeros((n_stocks, len(loadings)))
-            factor_names = list(loadings.keys())
-            for i in range(n_stocks):
-                f = calcs[i].latest_factors
-                for j, name in enumerate(factor_names):
-                    factor_mat[i, j] = f.get(name, 0.0)
+            # (i.e. data up to and including day t-1 — no look-ahead).
+            factor_mat = _sim_factor_matrix(close, volume, t, list(loadings.keys()))
             # Cross-sectional standardization (matches calibration transform).
             mu = factor_mat.mean(axis=0)
             sd = factor_mat.std(axis=0)
             sd_safe = np.where(sd > 1e-12, sd, 1.0)
             z = (factor_mat - mu) / sd_safe
-            betas = np.array([loadings[n] for n in factor_names])
+            betas = np.array([loadings[n] for n in loadings.keys()])
             pred = z @ betas
             ret = alpha + pred + stock_market_betas * mkt_ret + rng.normal(0, 1, n_stocks) * vol_noise_scale
 
@@ -341,10 +328,75 @@ def generate_simulated_market(
                 market_return=float(mkt_ret),
             )
             day_bars[sym] = bar
-            calcs[i].update(bar)
 
         bars_by_date[date] = day_bars
         universe.add(date, symbols)
         market_returns[date] = float(mkt_ret)
 
     return bars_by_date, universe, market_returns
+
+
+def _sim_factor_matrix(
+    close: np.ndarray,
+    volume: np.ndarray,
+    t: int,
+    names: list[str],
+) -> np.ndarray:
+    """Compute simulator factors from price/volume history up to (excluding) day t.
+
+    The simulator only drives returns with a small set of cheap-to-compute
+    factors; the full 11-factor set is computed later (via polars) from the
+    generated panel.  Returns an ``(n_stocks, len(names))`` matrix.
+
+    Supported names: momentum_5d, momentum_20d, ma_dev_20, volatility_20d,
+    volume_ratio.
+    """
+    n_stocks = close.shape[1]
+    out = np.zeros((n_stocks, len(names)))
+    for j, name in enumerate(names):
+        if name == "momentum_5d":
+            out[:, j] = (close[t - 1] - close[t - 6]) / close[t - 6]
+        elif name == "momentum_20d":
+            out[:, j] = (close[t - 1] - close[t - 21]) / close[t - 21]
+        elif name == "ma_dev_20":
+            sma = close[t - 20:t].mean(axis=0)
+            out[:, j] = (close[t - 1] - sma) / sma
+        elif name == "volatility_20d":
+            rets = close[1:t] / close[:t - 1] - 1.0          # (t-1, N)
+            out[:, j] = rets[t - 21:].std(axis=0, ddof=0)     # last 20 returns
+        elif name == "volume_ratio":
+            vsma = volume[t - 20:t].mean(axis=0)
+            out[:, j] = volume[t - 1] / vsma
+        else:
+            raise ValueError(f"Unsupported simulator factor: {name}")
+    return out
+
+
+def bars_to_frame(bars_by_date: dict) -> "object":
+    """Flatten ``{date: {symbol: DailyBar}}`` into a long-format polars DataFrame.
+
+    One row per (symbol, date) with every ``DailyBar`` field as a column.  This
+    is the input shape for ``factors.compute_factor_panel``.
+    """
+    import polars as pl
+
+    records = []
+    for date, day in bars_by_date.items():
+        for sym, b in day.items():
+            records.append({
+                "date": date,
+                "symbol": sym,
+                "open": b.open,
+                "high": b.high,
+                "low": b.low,
+                "close": b.close,
+                "volume": b.volume,
+                "amount": b.amount,
+                "prev_close": b.prev_close,
+                "limit_up_price": b.limit_up_price,
+                "limit_down_price": b.limit_down_price,
+                "is_suspended": b.is_suspended,
+                "total_shares": b.total_shares,
+                "market_return": b.market_return,
+            })
+    return pl.DataFrame(records)

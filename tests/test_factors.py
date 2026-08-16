@@ -1,34 +1,43 @@
-"""Tests for factors.py: FactorCalculator and compute_cross_section.
+"""Tests for factors.py: polars-vectorized compute_factor_panel and
+factor_panel_to_dict.
 
-Each test feeds a synthetic OHLCV stream into a FactorCalculator and checks
-the computed factor values against hand-computed expectations.
+Each test builds a small long-format DataFrame (one row per symbol, date),
+runs ``compute_factor_panel``, and checks factor values against hand-computed
+expectations.
 """
 
+import numpy as np
+import polars as pl
 import pytest
-from alftrade.data import DailyBar, compute_limit_prices
-from alftrade.factors import FactorCalculator, FACTOR_NAMES, compute_cross_section
+
+from alftrade.factors import FACTOR_NAMES, compute_factor_panel, factor_panel_to_dict
 
 
-def _bar(date, close, prev_close, open_=None, high=None, low=None,
-         volume=1000.0, total_shares=1e8):
-    """Build a minimal DailyBar with auto OHLC and price-limit metadata."""
-    o = open_ if open_ is not None else prev_close
-    h = high if high is not None else max(o, close) * 1.001
-    l = low if low is not None else min(o, close) * 0.999
-    up, dn = compute_limit_prices(prev_close, 0.10)
-    return DailyBar(
-        date=date, symbol="TEST",
-        open=o, high=h, low=l, close=close,
-        volume=volume, amount=close * volume,
-        prev_close=prev_close, limit_up_price=up, limit_down_price=dn,
-        total_shares=total_shares,
-    )
+# ── Helpers ────────────────────────────────────────────────────────────
+
+def _df_single(closes, market_returns=None, symbol="A", date_base=1):
+    """Build a one-symbol long table from a list of closes."""
+    rows = []
+    for i, c in enumerate(closes):
+        prev = closes[i - 1] if i > 0 else c
+        mkt = market_returns[i] if market_returns is not None else 0.0
+        rows.append({
+            "date": date_base + i, "symbol": symbol,
+            "open": prev, "high": c * 1.001, "low": c * 0.999, "close": c,
+            "volume": 1000.0, "amount": c * 1000.0,
+            "prev_close": prev, "market_return": mkt,
+        })
+    return pl.DataFrame(rows)
 
 
-# ── FactorCalculator basics ────────────────────────────────────────────
+def _last(df, name):
+    """Return the factor value on the last row for the given column."""
+    return df[name][-1]
+
+
+# ── FACTOR_NAMES ───────────────────────────────────────────────────────
 
 def test_factor_names_canonical():
-    """FACTOR_NAMES has the 11 expected factors in order."""
     assert FACTOR_NAMES == [
         "daily_return", "overnight_return", "intraday_return",
         "momentum_5d", "momentum_20d", "ma_dev_20", "volatility_20d",
@@ -36,198 +45,166 @@ def test_factor_names_canonical():
     ]
 
 
-def test_latest_factors_before_update():
-    """A fresh calculator returns all factors as 0.0."""
-    calc = FactorCalculator()
-    f = calc.latest_factors
-    assert set(f.keys()) == set(FACTOR_NAMES)
-    assert all(v == 0.0 for v in f.values())
+def test_factor_panel_columns_and_no_nan():
+    """The factor panel has [date, symbol] + 11 factors and no NaN."""
+    df = _df_single([100.0 + i for i in range(30)])
+    out = compute_factor_panel(df)
+    assert out.columns[:2] == ["date", "symbol"]
+    assert out.columns[2:] == FACTOR_NAMES
+    assert out.null_count().sum_horizontal()[0] == 0  # no nulls
 
+
+# ── Price-based factors ────────────────────────────────────────────────
 
 def test_daily_return():
-    """daily_return = (close - prev_close) / prev_close."""
-    calc = FactorCalculator()
-    f = calc.update(_bar(1, close=105.0, prev_close=100.0))
-    assert f["daily_return"] == pytest.approx(0.05)
+    df = _df_single([100.0, 105.0])
+    out = compute_factor_panel(df)
+    assert _last(out, "daily_return") == pytest.approx(0.05)
 
 
-def test_overnight_return():
-    """overnight_return = (open - prev_close) / prev_close."""
-    calc = FactorCalculator()
-    f = calc.update(_bar(1, close=105.0, prev_close=100.0, open_=102.0))
-    assert f["overnight_return"] == pytest.approx(0.02)
+def test_overnight_and_intraday_return():
+    # Manually set open to distinguish overnight vs intraday.
+    rows = [
+        {"date": 1, "symbol": "A", "open": 100.0, "high": 105.0, "low": 100.0,
+         "close": 105.0, "volume": 1000.0, "amount": 105000.0,
+         "prev_close": 100.0, "market_return": 0.0},
+        {"date": 2, "symbol": "A", "open": 102.0, "high": 106.0, "low": 102.0,
+         "close": 105.0, "volume": 1000.0, "amount": 105000.0,
+         "prev_close": 105.0, "market_return": 0.0},
+    ]
+    out = compute_factor_panel(pl.DataFrame(rows))
+    row = out.row(-1, named=True)
+    assert row["overnight_return"] == pytest.approx((102.0 - 105.0) / 105.0)
+    assert row["intraday_return"] == pytest.approx((105.0 - 102.0) / 102.0)
 
 
-def test_intraday_return():
-    """intraday_return = (close - open) / open."""
-    calc = FactorCalculator()
-    f = calc.update(_bar(1, close=105.0, prev_close=100.0, open_=102.0))
-    assert f["intraday_return"] == pytest.approx((105.0 - 102.0) / 102.0)
-
+# ── Momentum ───────────────────────────────────────────────────────────
 
 def test_momentum_5d():
-    """momentum_5d = (close - close[t-5]) / close[t-5] after 6 bars."""
-    calc = FactorCalculator()
-    prices = [100.0, 101.0, 102.0, 103.0, 104.0, 110.0]
-    prev = 100.0
-    for i, p in enumerate(prices):
-        f = calc.update(_bar(i + 1, close=p, prev_close=prev))
-        prev = p
-    # After 6 bars, momentum_5d = (110 - 100) / 100 = 0.10
-    assert f["momentum_5d"] == pytest.approx(0.10)
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 110.0]
+    out = compute_factor_panel(_df_single(closes))
+    assert _last(out, "momentum_5d") == pytest.approx((110.0 - 100.0) / 100.0)
 
 
-def test_momentum_5d_zero_before_enough_history():
-    """momentum_5d is 0 until 6 bars have been seen."""
-    calc = FactorCalculator()
-    f = calc.update(_bar(1, close=100.0, prev_close=100.0))
-    assert f["momentum_5d"] == 0.0
-    f = calc.update(_bar(2, close=101.0, prev_close=100.0))
-    assert f["momentum_5d"] == 0.0
+def test_momentum_20d():
+    closes = [100.0 + i * 0.5 for i in range(21)]
+    out = compute_factor_panel(_df_single(closes))
+    assert _last(out, "momentum_20d") == pytest.approx((110.0 - 100.0) / 100.0)
 
+
+# ── ma_dev_20 ──────────────────────────────────────────────────────────
 
 def test_ma_dev_20():
-    """ma_dev_20 = (close - SMA20) / SMA20."""
-    calc = FactorCalculator(sma_window=20)
-    # Feed 20 bars all at 100, then one at 110.
+    closes = [100.0] * 20 + [110.0]
+    out = compute_factor_panel(_df_single(closes))
+    # rolling_mean(20) at row 21 = mean of rows 2..21 = (19*100 + 110)/20
+    sma = (19 * 100.0 + 110.0) / 20
+    assert _last(out, "ma_dev_20") == pytest.approx((110.0 - sma) / sma)
+
+
+# ── Volatility ─────────────────────────────────────────────────────────
+
+def test_volatility_20d_nonneg_and_positive():
+    # Alternating returns → nonzero volatility.
+    closes = [100.0]
     prev = 100.0
     for i in range(20):
-        f = calc.update(_bar(i + 1, close=100.0, prev_close=prev))
-        prev = 100.0
-    f = calc.update(_bar(21, close=110.0, prev_close=100.0))
-    # SMA20 over the window of 21 bars: deque maxlen is 21, so all 21 closes
-    # are in the window → SMA = (20*100 + 110)/21
-    sma = (20 * 100.0 + 110.0) / 21
-    assert f["ma_dev_20"] == pytest.approx((110.0 - sma) / sma)
+        prev = prev * (1.0 + (0.01 if i % 2 == 0 else -0.005))
+        closes.append(prev)
+    out = compute_factor_panel(_df_single(closes))
+    assert _last(out, "volatility_20d") > 0
 
 
-def test_volatility_20d_nonneg():
-    """volatility_20d is a std, so it is ≥ 0, and > 0 with varying returns."""
-    calc = FactorCalculator()
-    # Alternating up/down returns produce nonzero volatility.
-    prev = 100.0
-    for i in range(20):
-        p = prev * (1.01 if i % 2 == 0 else -0.005 + 1)
-        f = calc.update(_bar(i + 1, close=p, prev_close=prev))
-        prev = p
-    assert f["volatility_20d"] > 0
-
+# ── Volume ratio ───────────────────────────────────────────────────────
 
 def test_volume_ratio():
-    """volume_ratio = today_volume / SMA(volume, window)."""
-    calc = FactorCalculator()
-    # First 3 bars at volume 1000 → SMA = 1000; 4th bar at 2000 → ratio = 2.0
-    # but the deque maxlen is 20, so after 4 bars SMA = (1000*3 + 2000)/4 = 1250
-    # and ratio = 2000/1250 = 1.6.
-    prev = 100.0
-    for i in range(3):
-        f = calc.update(_bar(i + 1, close=100.0, prev_close=prev, volume=1000.0))
-        prev = 100.0
-    f = calc.update(_bar(4, close=100.0, prev_close=prev, volume=2000.0))
-    assert f["volume_ratio"] == pytest.approx(2000.0 / 1250.0)
-
-
-def test_rsi_14_range_and_neutrality():
-    """RSI is in [-1, 1] after rescaling and starts near 0 (neutral=50)."""
-    calc = FactorCalculator(rsi_window=14)
+    rows = []
     prev = 100.0
     for i in range(20):
-        p = prev * (1.0 + (0.001 if i % 2 else -0.001))
-        f = calc.update(_bar(i + 1, close=p, prev_close=prev))
-        prev = p
-    assert -1.0 <= f["rsi_14"] <= 1.0
+        vol = 1000.0 if i < 19 else 2000.0
+        rows.append({"date": i + 1, "symbol": "A", "open": prev, "high": 101.0,
+                     "low": 99.0, "close": 100.0, "volume": vol,
+                     "amount": vol * 100.0, "prev_close": prev,
+                     "market_return": 0.0})
+    out = compute_factor_panel(pl.DataFrame(rows))
+    # rolling_mean(20) of volume at last row = (19*1000 + 2000)/20 = 1050
+    assert _last(out, "volume_ratio") == pytest.approx(2000.0 / 1050.0)
 
 
-def test_rsi_14_all_up_moves_positive():
-    """A pure up-trend pushes RSI toward +1 (RSI raw → 100)."""
-    calc = FactorCalculator(rsi_window=14)
+# ── RSI ────────────────────────────────────────────────────────────────
+
+def test_rsi_range():
+    closes = [100.0]
     prev = 100.0
     for i in range(30):
-        p = prev * 1.01
-        f = calc.update(_bar(i + 1, close=p, prev_close=prev))
-        prev = p
-    assert f["rsi_14"] > 0.9  # near +1
+        prev = prev * (1.0 + (0.001 if i % 2 else -0.001))
+        closes.append(prev)
+    out = compute_factor_panel(_df_single(closes))
+    assert -1.0 <= _last(out, "rsi_14") <= 1.0
 
+
+def test_rsi_pure_uptrend_positive():
+    closes = [100.0 * (1.01 ** i) for i in range(30)]
+    out = compute_factor_panel(_df_single(closes))
+    # All gains → RSI raw ≈ 100 → rescaled ≈ +1.0.
+    assert _last(out, "rsi_14") > 0.9
+
+
+# ── ATR ────────────────────────────────────────────────────────────────
 
 def test_atr_pct_14_positive():
-    """ATR as a fraction of close is positive once high-low spreads exist."""
-    calc = FactorCalculator(atr_window=14)
+    rows = []
     prev = 100.0
     for i in range(20):
-        f = calc.update(_bar(i + 1, close=100.0, prev_close=prev,
-                             high=101.0, low=99.0))
+        rows.append({"date": i + 1, "symbol": "A", "open": 100.0, "high": 101.0,
+                     "low": 99.0, "close": 100.0, "volume": 1000.0,
+                     "amount": 100000.0, "prev_close": prev,
+                     "market_return": 0.0})
         prev = 100.0
-    assert f["atr_pct_14"] > 0
+    out = compute_factor_panel(pl.DataFrame(rows))
+    assert _last(out, "atr_pct_14") > 0
 
 
-def test_reset_clears_state():
-    """After reset, factors revert to 0 and rolling windows start over."""
-    calc = FactorCalculator()
-    for i in range(10):
-        calc.update(_bar(i + 1, close=100.0 + i, prev_close=100.0 + i - 1))
-    assert calc.latest_factors["momentum_5d"] != 0.0
-    calc.reset()
-    assert all(v == 0.0 for v in calc.latest_factors.values())
-    # First bar after reset: momentum_5d should be 0 (no history).
-    f = calc.update(_bar(1, close=100.0, prev_close=100.0))
-    assert f["momentum_5d"] == 0.0
+# ── Market beta ────────────────────────────────────────────────────────
 
-
-# ── compute_cross_section ──────────────────────────────────────────────
-
-def test_compute_cross_section_returns_per_symbol():
-    """compute_cross_section advances every calculator and returns factors."""
-    bar1 = _bar(1, close=100.0, prev_close=99.0)
-    bar1.symbol = "A"
-    bar2 = _bar(1, close=200.0, prev_close=198.0)
-    bar2.symbol = "B"
-    calcs = {}
-    out = compute_cross_section({"A": bar1, "B": bar2}, calcs)
-    assert set(out.keys()) == {"A", "B"}
-    assert out["A"]["daily_return"] == pytest.approx((100.0 - 99.0) / 99.0)
-    assert out["B"]["daily_return"] == pytest.approx((200.0 - 198.0) / 198.0)
-    # Calculators are stored for reuse across dates.
-    assert set(calcs.keys()) == {"A", "B"}
-
-
-# ── market_beta factor ──────────────────────────────────────────────
-
-def test_market_beta_defaults_to_neutral():
-    """With no market returns, market_beta stays at 1.0 (neutral)."""
-    calc = FactorCalculator()
-    # Feed several bars with market_return=0.
-    prev = 100.0
-    for i in range(30):
-        # _bar helper doesn't set market_return; it defaults to 0.
-        f = calc.update(_bar(i + 1, close=100.0 + i * 0.1, prev_close=prev))
-        prev = 100.0 + i * 0.1
-    # When market_return is always 0, cov=0 → beta=1.0 (fallback).
-    assert f["market_beta"] == 1.0
-
-
-def test_market_beta_recovers_known_loading():
-    """When daily_return = 0.5 × market_return + noise, beta ≈ 0.5."""
-    calc = FactorCalculator(beta_window=30)
-    prev = 100.0
-    for i in range(40):
-        mkt = (i % 3 - 1) * 0.01  # alternating market
-        # stock return = 1.2 × mkt + noise → true beta = 1.2
-        noise = (i % 7 - 3) * 0.002
-        ret = 1.2 * mkt + noise
-        close = prev * (1.0 + ret)
-        bar = _bar(i + 1, close=close, prev_close=prev)
-        bar.market_return = mkt
-        f = calc.update(bar)
+def test_market_beta_recovers_loading():
+    """daily_return = 1.2 × market_return + noise → beta ≈ 1.2."""
+    rng = np.random.default_rng(42)
+    market = rng.normal(0.0, 0.01, 60)
+    returns = 1.2 * market + rng.normal(0.0, 0.002, 60)
+    df = _df_single([100.0], market_returns=[0.0])
+    # Rebuild with explicit returns.
+    rows = []
+    close = 100.0
+    for i in range(60):
         prev = close
-    # After 40 bars with 30-day window, beta should be ~1.2.
-    assert 0.8 <= f["market_beta"] <= 1.6
+        close = prev * (1.0 + returns[i])
+        rows.append({"date": i + 1, "symbol": "A", "open": prev,
+                     "high": close * 1.001, "low": close * 0.999, "close": close,
+                     "volume": 1000.0, "amount": close * 1000.0,
+                     "prev_close": prev, "market_return": market[i]})
+    out = compute_factor_panel(pl.DataFrame(rows))
+    assert 1.0 <= _last(out, "market_beta") <= 1.4
 
 
-def test_compute_cross_section_creates_missing_calculator():
-    """A symbol without a pre-existing calculator gets a new one."""
-    bar = _bar(1, close=100.0, prev_close=100.0)
-    bar.symbol = "NEW"
-    calcs = {}
-    out = compute_cross_section({"NEW": bar}, calcs)
-    assert "NEW" in calcs
-    assert out["NEW"]["daily_return"] == pytest.approx(0.0)
+def test_market_beta_warmup_neutral():
+    """With no market variation, beta falls back to 1.0."""
+    df = _df_single([100.0 + i * 0.1 for i in range(30)])  # market_return all 0
+    out = compute_factor_panel(df)
+    # market_return has zero variance → beta = 1.0 (fallback).
+    assert _last(out, "market_beta") == 1.0
+
+
+# ── factor_panel_to_dict ───────────────────────────────────────────────
+
+def test_factor_panel_to_dict_structure():
+    df = pl.concat([
+        _df_single([100.0 + i for i in range(5)], symbol="A"),
+        _df_single([50.0 + i for i in range(5)], symbol="B"),
+    ])
+    out = compute_factor_panel(df)
+    d = factor_panel_to_dict(out)
+    assert set(d.keys()) == {1, 2, 3, 4, 5}
+    assert set(d[5].keys()) == {"A", "B"}
+    assert set(d[5]["A"].keys()) == set(FACTOR_NAMES)
+    assert isinstance(d[5]["A"]["daily_return"], float)

@@ -1,14 +1,18 @@
 """
-engine.py - Cross-sectional trading engine that consumes daily bars and
-produces per-stock signals.
+engine.py - Cross-sectional trading engine that consumes precomputed daily
+factors and produces per-stock signals.
 
 This is the daily, multi-stock analogue of hftrade's ``TradingEngine.on_tick``.
-The data flow is:
+Factors are computed *outside* the engine (by ``factors.compute_factor_panel``
+over the parquet-read panel) and handed in as a ``{date: {symbol: factors}}``
+mapping; the engine looks up a day's factors, standardizes them
+cross-sectionally, and emits signals. The data flow is:
 
-    DailyBar[s]  →  TradingEngine.on_cross_section(date, bars)
-                 →  FactorCalculator[s].update(bar)
-                 →  cross-sectional standardization
-                 →  Signal[s]  (one list per stock)
+    parquet panel ──(polars)──> factor panel ──> {date: {symbol: factors}}
+                                                         ↓
+    TradingEngine.on_cross_section(date, bars) ──> cross-sectional standardization
+                                                         ↓
+                                                Signal[s]  (one list per stock)
 
 Two signal-generation modes (same split as hftrade):
 
@@ -52,10 +56,11 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 
 from alftrade.data import DailyBar
-from alftrade.factors import FactorCalculator, FACTOR_NAMES, compute_cross_section
+from alftrade.factors import FACTOR_NAMES
 
 if TYPE_CHECKING:
     from alftrade.calibration import CalibrationResult
+
 
 
 class Signal:
@@ -149,13 +154,17 @@ def standardize_cross_section(
 
 
 class TradingEngine:
-    """Processes one day's cross-section of bars into per-stock signals.
+    """Processes one day's cross-section of factors into per-stock signals.
 
-    Owns the per-symbol ``FactorCalculator`` instances (so rolling state
-    persists across days). Call ``on_cross_section`` once per trading day
-    with that day's ``{symbol: DailyBar}`` map.
+    Factors are precomputed outside the engine (via polars) and supplied as a
+    ``factors`` mapping ``{date: {symbol: {factor: value}}}``. Call
+    ``on_cross_section`` once per trading day with that day's
+    ``{symbol: DailyBar}`` map (bars are only used for suspension filtering
+    and, via ``build_cross_section``, to carry prices into calibration).
 
     Args:
+        factors: Precomputed factors ``{date: {symbol: {factor: value}}}``
+            (see ``factors.factor_panel_to_dict`` / ``store.load_factor_panel``).
         factor_names: Ordered factors to use. Defaults to all in
             ``FACTOR_NAMES``. Calibration β and these names must match.
         calibration: Optional ``CalibrationResult`` for calibrated mode.
@@ -173,11 +182,13 @@ class TradingEngine:
 
     def __init__(
         self,
+        factors: dict[int, dict[str, dict[str, float]]],
         factor_names: Optional[list[str]] = None,
         calibration: "Optional[CalibrationResult]" = None,
         raw_thresholds: Optional[dict[str, float]] = None,
         neutralize: Optional[list[str]] = None,
     ):
+        self.factors = factors
         self.factor_names = list(factor_names or FACTOR_NAMES)
         self.calibration = calibration
         self.raw_thresholds = raw_thresholds or {
@@ -187,16 +198,18 @@ class TradingEngine:
             "ma_dev_20": 0.02,
         }
         self.neutralize = neutralize
-        self._calcs: dict[str, FactorCalculator] = {}
+
+    def _day_factors(self, date: int, bars: dict[str, DailyBar]) -> dict[str, dict[str, float]]:
+        """Return the precomputed factors for `date`, restricted to non-suspended symbols."""
+        day = self.factors.get(date, {})
+        return {s: day[s] for s in bars if not bars[s].is_suspended and s in day}
 
     def on_cross_section(self, date: int, bars: dict[str, DailyBar]) -> dict[str, list[Signal]]:
         """Process one date's bars and return {symbol: [Signal]}.
 
-        Drops suspended symbols (no factors, no signals). Advances each
-        symbol's rolling factor state as a side effect.
+        Drops suspended symbols (no factors, no signals).
         """
-        tradeable = {s: b for s, b in bars.items() if not b.is_suspended}
-        factors_by_symbol = compute_cross_section(tradeable, self._calcs)
+        factors_by_symbol = self._day_factors(date, bars)
         if not factors_by_symbol:
             return {}
 
@@ -205,13 +218,14 @@ class TradingEngine:
         return self._raw_signals(factors_by_symbol)
 
     def build_cross_section(self, date: int, bars: dict[str, DailyBar]) -> CrossSection:
-        """Compute factors + standardized matrix without generating signals.
+        """Build the standardized factor matrix for one date.
 
         Used by the calibrator/profiler during the offline phase so they
         share the exact same factor pipeline as the live engine.
         """
         tradeable = {s: b for s, b in bars.items() if not b.is_suspended}
-        factors_by_symbol = compute_cross_section(tradeable, self._calcs)
+        factors_by_symbol = {s: self.factors.get(date, {}).get(s, {})
+                             for s in tradeable if s in self.factors.get(date, {})}
         Z, symbols = standardize_cross_section(
             factors_by_symbol, self.factor_names, neutralize=self.neutralize)
         return CrossSection(
@@ -273,5 +287,5 @@ class TradingEngine:
         return out
 
     def reset(self) -> None:
-        """Drop all per-symbol factor calculators (start a new backtest)."""
-        self._calcs.clear()
+        """No-op: the engine is stateless (factors are precomputed externally)."""
+        pass

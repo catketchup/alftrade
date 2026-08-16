@@ -11,11 +11,11 @@ from alftrade.profiler import FactorProfile, ModelProfile, FactorProfiler
 
 # ── Basic structure ────────────────────────────────────────────────────
 
-def test_profile_returns_model_profile(market):
+def test_profile_returns_model_profile(market, factors):
     """profile() returns a ModelProfile with per-factor profiles."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -30,11 +30,11 @@ def test_profile_returns_model_profile(market):
         assert isinstance(fp, FactorProfile)
 
 
-def test_profile_has_all_factors(market):
+def test_profile_has_all_factors(market, factors):
     """Every FACTOR_NAMES entry appears exactly once in factor_profiles."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -45,11 +45,11 @@ def test_profile_has_all_factors(market):
 
 # ── Ranges ─────────────────────────────────────────────────────────────
 
-def test_ic_in_valid_range(market):
+def test_ic_in_valid_range(market, factors):
     """Every per-factor IC lies in [-1, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -59,11 +59,11 @@ def test_ic_in_valid_range(market):
         assert -1.0 <= fp.ic_mean <= 1.0
 
 
-def test_p_value_in_unit_interval(market):
+def test_p_value_in_unit_interval(market, factors):
     """p-values lie in [0, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -72,11 +72,11 @@ def test_p_value_in_unit_interval(market):
         assert 0.0 <= fp.p_value <= 1.0
 
 
-def test_coverage_in_unit_interval(market):
+def test_coverage_in_unit_interval(market, factors):
     """Coverage is a fraction in [0, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -85,11 +85,11 @@ def test_coverage_in_unit_interval(market):
         assert 0.0 <= fp.coverage <= 1.0
 
 
-def test_turnover_in_unit_interval(market):
+def test_turnover_in_unit_interval(market, factors):
     """Turnover (normalized rank change) lies in [0, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -98,11 +98,11 @@ def test_turnover_in_unit_interval(market):
         assert 0.0 <= fp.turnover <= 1.0
 
 
-def test_quantile_returns_length(market):
+def test_quantile_returns_length(market, factors):
     """quantile_returns has exactly n_quantiles entries."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -112,11 +112,11 @@ def test_quantile_returns_length(market):
         assert len(fp.quantile_returns) == 5
 
 
-def test_monotonicity_in_valid_range(market):
+def test_monotonicity_in_valid_range(market, factors):
     """Monotonicity (Spearman rho) lies in [-1, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -128,11 +128,11 @@ def test_monotonicity_in_valid_range(market):
 
 # ── Predictability recovery ───────────────────────────────────────────
 
-def test_strongest_factor_has_high_abs_ic(market):
+def test_strongest_factor_has_high_abs_ic(market, factors):
     """volatility_20d (the simulator's strongest loaded factor) has |IC|>0.1."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -143,11 +143,11 @@ def test_strongest_factor_has_high_abs_ic(market):
     assert vol.monotonicity < 0
 
 
-def test_model_monotonicity_positive(market):
+def test_model_monotonicity_positive(market, factors):
     """Model predictions sort stocks in the right direction on average."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -158,11 +158,11 @@ def test_model_monotonicity_positive(market):
 
 # ── selected_factors ───────────────────────────────────────────────────
 
-def test_selected_factors_filters_by_p_value(market):
+def test_selected_factors_filters_by_p_value(market, factors):
     """selected_factors returns only factors below the p-value threshold."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -175,11 +175,11 @@ def test_selected_factors_filters_by_p_value(market):
             assert fp.p_value >= 0.05
 
 
-def test_selected_factors_includes_strongest(market):
+def test_selected_factors_includes_strongest(market, factors):
     """volatility_20d is significant and therefore selected at p<0.05."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -190,11 +190,11 @@ def test_selected_factors_includes_strongest(market):
 
 # ── repr ───────────────────────────────────────────────────────────────
 
-def test_model_profile_repr_lists_factors(market):
+def test_model_profile_repr_lists_factors(market, factors):
     """repr lists every factor and the significance legend."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)

@@ -4,9 +4,11 @@ alftrade/calibration.py
 alftrade/data.py
 alftrade/engine.py
 alftrade/factors.py
+alftrade/hedge.py
 alftrade/portfolio.py
 alftrade/profiler.py
 alftrade/risk.py
+alftrade/store.py
 alftrade.egg-info/PKG-INFO
 alftrade.egg-info/SOURCES.txt
 alftrade.egg-info/dependency_links.txt
@@ -16,6 +18,8 @@ tests/test_calibration.py
 tests/test_data.py
 tests/test_engine.py
 tests/test_factors.py
+tests/test_hedge.py
 tests/test_portfolio.py
 tests/test_profiler.py
 tests/test_risk.py
+tests/test_store.py

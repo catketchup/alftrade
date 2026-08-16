@@ -37,11 +37,11 @@ def test_forward_return_zero_close():
 
 # ── collect / fit ──────────────────────────────────────────────────────
 
-def test_calibrator_not_ready_with_little_data(market):
+def test_calibrator_not_ready_with_little_data(market, factors):
     """With too few samples, ready is False and fit raises."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=10_000, min_dates=10_000)
     for d in dates[:5]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -50,11 +50,11 @@ def test_calibrator_not_ready_with_little_data(market):
         cal.fit()
 
 
-def test_fit_returns_calibration_result(market):
+def test_fit_returns_calibration_result(market, factors):
     """fit() on enough data returns a populated CalibrationResult."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -68,11 +68,11 @@ def test_fit_returns_calibration_result(market):
     assert set(result.ics.keys()) == set(FACTOR_NAMES)
 
 
-def test_fit_fama_macbeth_has_t_stats(market):
+def test_fit_fama_macbeth_has_t_stats(market, factors):
     """FM fit produces finite t-stats and p-values in [0, 1]."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -83,11 +83,11 @@ def test_fit_fama_macbeth_has_t_stats(market):
         assert 0.0 <= result.fm_p_values[name] <= 1.0
 
 
-def test_fit_pooled_has_no_t_stats(market):
+def test_fit_pooled_has_no_t_stats(market, factors):
     """Pooled fit leaves FM t-stats as NaN."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -97,12 +97,12 @@ def test_fit_pooled_has_no_t_stats(market):
         assert not np.isfinite(result.fm_t_stats[name])
 
 
-def test_fit_recovers_loaded_factor_sign(market):
+def test_fit_recovers_loaded_factor_sign(market, factors):
     """The simulator's strongest loaded factor (volatility, β<0) is
     recovered with the correct sign and high significance."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -113,13 +113,13 @@ def test_fit_recovers_loaded_factor_sign(market):
     assert result.ics["volatility_20d"] < 0
 
 
-def test_larger_alpha_shrinks_betas(market):
+def test_larger_alpha_shrinks_betas(market, factors):
     """A larger Ridge alpha shrinks β toward zero (regularization)."""
     bars, _, _ = market
     dates = sorted(bars)
 
     def fit_with(alpha):
-        eng = TradingEngine()
+        eng = TradingEngine(factors=factors)
         cal = FactorCalibrator(horizon=5, alpha=alpha, min_samples=50, min_dates=10)
         for d in dates[:-20]:
             cal.collect(d, eng.build_cross_section(d, bars[d]), bars)
@@ -131,11 +131,11 @@ def test_larger_alpha_shrinks_betas(market):
     assert sum(abs(v) for v in large.betas.values()) < sum(abs(v) for v in small.betas.values())
 
 
-def test_num_samples_and_dates_grow(market):
+def test_num_samples_and_dates_grow(market, factors):
     """collect() increases num_samples and num_dates over time."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     before = cal.num_samples
     for d in dates[:30]:
@@ -156,11 +156,11 @@ def test_reset_clears_data():
 
 # ── Persistence ────────────────────────────────────────────────────────
 
-def test_save_load_roundtrip(market, tmp_path):
+def test_save_load_roundtrip(market, tmp_path, factors):
     """save() then load() restores every field exactly."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)
@@ -177,11 +177,11 @@ def test_save_load_roundtrip(market, tmp_path):
     assert loaded.n_dates == result.n_dates
 
 
-def test_save_produces_valid_json(market, tmp_path):
+def test_save_produces_valid_json(market, tmp_path, factors):
     """The saved file is parseable JSON with the expected top-level keys."""
     bars, _, _ = market
     dates = sorted(bars)
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     cal = FactorCalibrator(horizon=5, min_samples=50, min_dates=10)
     for d in dates[:-20]:
         cal.collect(d, engine.build_cross_section(d, bars[d]), bars)

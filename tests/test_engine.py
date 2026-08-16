@@ -5,7 +5,8 @@ import pytest
 
 from alftrade.data import DailyBar, compute_limit_prices
 from alftrade.engine import Signal, TradingEngine, standardize_cross_section
-from alftrade.factors import FACTOR_NAMES
+from alftrade.factors import FACTOR_NAMES, compute_factor_panel, factor_panel_to_dict
+from alftrade.data import bars_to_frame
 
 
 def _bar(sym, close, prev_close, suspended=False):
@@ -28,6 +29,11 @@ def _panel(date, prices, prev_closes=None, suspended=None):
         s: _bar(s, prices[s], prev_closes.get(s, prices[s]), suspended[s])
         for s in syms
     }
+
+
+def _factor_map(bars_by_date):
+    """Compute factors for a {date: {sym: DailyBar}} panel via polars."""
+    return factor_panel_to_dict(compute_factor_panel(bars_to_frame(bars_by_date)))
 
 
 # ── Signal ─────────────────────────────────────────────────────────────
@@ -83,9 +89,6 @@ def test_neutralization_reduces_predictive_relationship():
         neutralize=["market_beta"],
     )
     assert Z_neut.shape == (5, 3)
-    # Regress post-neutralization vol on mkt: the raw (non-z-scored) residual
-    # dot product should be small. Since we only have Z, we check that the
-    # neutralization didn't crash and produced finite values.
     assert np.all(np.isfinite(Z_neut))
 
 
@@ -96,51 +99,25 @@ def test_neutralization_ignores_unknown_factors():
     assert Z.shape == (2, 2)
 
 
-# ── TradingEngine with neutralization ────────────────────────────────
-
-def test_engine_neutralize_parameter_flows_through(market):
-    """engine with neutralize ≠ None calls standardize with that arg."""
-    bars_by_date, _, _ = market
-    engine = TradingEngine(neutralize=["market_beta"])
-    d = sorted(bars_by_date)[-1]
-    cs = engine.build_cross_section(d, bars_by_date[d])
-    assert cs.z_matrix.shape[1] == 11  # still 11 factors
-
-
-def test_engine_neutralize_stores_and_passes_parameter(market, dates, calibration):
-    """Engine with neutralize stores it, and both build_cross_section and
-    on_cross_section run without error."""
-    bars_by_date, _, _ = market
-    d = dates[-25]
-    engine = TradingEngine(calibration=calibration, neutralize=["market_beta"])
-    assert engine.neutralize == ["market_beta"]
-
-    cs = engine.build_cross_section(d, bars_by_date[d])
-    assert cs.z_matrix.shape[1] == 11
-    assert np.all(np.isfinite(cs.z_matrix))
-
-    sigs = engine.on_cross_section(d, bars_by_date[d])
-    assert len(sigs) > 0
-
-
 # ── TradingEngine: raw mode ────────────────────────────────────────────
 
 def test_raw_mode_emits_signals_for_strong_factors():
     """Raw mode fires a Signal when a factor exceeds its threshold."""
-    engine = TradingEngine(raw_thresholds={"momentum_5d": 0.02})
     # Build a panel where prices rise ~1%/day so 5-day momentum > 2%.
-    bars_series = []
+    bars_by_date = {}
     for t in range(6):
         prices = {f"S{i}": 100.0 * (1.0 + 0.01 * t + 0.0005 * i * t) for i in range(10)}
         if t == 0:
             prev = {s: 100.0 for s in prices}
         else:
-            prev = {s: bars_series[-1][s].close for s in prices}
-        bars_series.append(_panel(t, prices, prev))
-    # Feed days 0..5 through the engine (advances its internal calculators).
+            prev = {s: bars_by_date[t - 1][s].close for s in prices}
+        bars_by_date[t] = _panel(t, prices, prev)
+
+    factors = _factor_map(bars_by_date)
+    engine = TradingEngine(factors=factors, raw_thresholds={"momentum_5d": 0.02})
     out = {}
-    for t, bars in enumerate(bars_series):
-        out = engine.on_cross_section(t, bars)
+    for t in range(6):
+        out = engine.on_cross_section(t, bars_by_date[t])
     # After 6 rising days, momentum_5d should exceed 0.02 for most stocks.
     assert len(out) > 0
     for sigs in out.values():
@@ -151,36 +128,26 @@ def test_raw_mode_emits_signals_for_strong_factors():
 
 def test_raw_mode_skips_suspended():
     """Suspended symbols produce no signals."""
-    engine = TradingEngine(raw_thresholds={"daily_return": 0.001})
     bars = {
-        "A": _bar("A", 110.0, 100.0, suspended=True),   # would fire but suspended
+        "A": _bar("A", 110.0, 100.0, suspended=True),
         "B": _bar("B", 110.0, 100.0, suspended=False),
     }
+    factors = _factor_map({1: bars})
+    engine = TradingEngine(factors=factors, raw_thresholds={"daily_return": 0.001})
     out = engine.on_cross_section(1, bars)
     assert "A" not in out
     assert "B" in out
 
 
-def test_engine_reset_clears_state():
-    """reset() drops per-symbol factor calculators."""
-    engine = TradingEngine()
-    engine.on_cross_section(1, {"A": _bar("A", 100.0, 100.0)})
-    assert "A" in engine._calcs
-    engine.reset()
-    assert engine._calcs == {}
-
-
 # ── TradingEngine: calibrated mode ─────────────────────────────────────
 
-def test_calibrated_mode_uses_betas(market, dates, calibration):
+def test_calibrated_mode_uses_betas(market, dates, calibration, factors):
     """In calibrated mode, signal strength is the model's predicted return."""
     bars_by_date, _, _ = market
-    engine = TradingEngine(calibration=calibration)
-    # Pick a date late enough that factors are well-defined.
+    engine = TradingEngine(factors=factors, calibration=calibration)
     d = dates[-25]
     out = engine.on_cross_section(d, bars_by_date[d])
     assert len(out) > 0
-    # Every emitted signal should be the single "model" signal.
     for sigs in out.values():
         assert len(sigs) == 1
         assert sigs[0].name == "model"
@@ -188,48 +155,43 @@ def test_calibrated_mode_uses_betas(market, dates, calibration):
         assert sigs[0].strength >= 0
 
 
-def test_calibrated_mode_strength_matches_prediction(market, dates, calibration):
-    """strength = |Σ β_k · z_k| computed independently matches the engine's signal.
-
-    Two fresh engines replay the same history: one via on_cross_section
-    (produces signals), one via build_cross_section (produces the z_matrix).
-    Both advance their per-symbol calculators identically, so their factor
-    states match and the hand-computed prediction must equal the signal
-    strength.
-    """
+def test_calibrated_mode_strength_matches_prediction(market, dates, calibration, factors):
+    """strength = |Σ β_k · z_k| computed independently matches the engine's signal."""
     bars_by_date, _, _ = market
     d = dates[-25]
+    engine = TradingEngine(factors=factors, calibration=calibration)
+    out = engine.on_cross_section(d, bars_by_date[d])
+    cs = engine.build_cross_section(d, bars_by_date[d])
 
-    # Engine 1: replay history, capturing signals on date d.
-    engine = TradingEngine(calibration=calibration)
-    out = None
-    for dd in dates:
-        if dd > d:
-            break
-        out = engine.on_cross_section(dd, bars_by_date[dd])
-
-    # Engine 2: replay history, capturing the cross-section on date d.
-    eng2 = TradingEngine(calibration=calibration)
-    cs = None
-    for dd in dates:
-        if dd > d:
-            break
-        cs = eng2.build_cross_section(dd, bars_by_date[dd])
-
-    assert cs is not None and out is not None
     betas = np.array([calibration.betas.get(n, 0.0) for n in cs.factor_names])
     pred = cs.z_matrix @ betas
     for i, sym in enumerate(cs.symbols):
         if sym in out:
-            expected = abs(float(pred[i]))
-            assert out[sym][0].strength == pytest.approx(expected, abs=1e-9)
+            assert out[sym][0].strength == pytest.approx(abs(float(pred[i])), abs=1e-9)
 
 
-def test_build_cross_section_shape(market, dates):
+def test_build_cross_section_shape(market, dates, factors):
     """build_cross_section returns a z_matrix matching symbols × factors."""
     bars_by_date, _, _ = market
-    engine = TradingEngine()
+    engine = TradingEngine(factors=factors)
     d = dates[-25]
     cs = engine.build_cross_section(d, bars_by_date[d])
     assert cs.z_matrix.shape == (len(cs.symbols), len(cs.factor_names))
     assert set(cs.symbols) == set(bars_by_date[d].keys())
+
+
+def test_engine_neutralize_stores_and_passes_parameter(market, dates, calibration, factors):
+    """Engine with neutralize stores it, and both build_cross_section and
+    on_cross_section run without error."""
+    bars_by_date, _, _ = market
+    d = dates[-25]
+    engine = TradingEngine(factors=factors, calibration=calibration,
+                           neutralize=["market_beta"])
+    assert engine.neutralize == ["market_beta"]
+
+    cs = engine.build_cross_section(d, bars_by_date[d])
+    assert cs.z_matrix.shape[1] == 11
+    assert np.all(np.isfinite(cs.z_matrix))
+
+    sigs = engine.on_cross_section(d, bars_by_date[d])
+    assert len(sigs) > 0
