@@ -38,6 +38,7 @@ import polars as pl
 
 from alftrade.data import DailyBar, StockUniverse
 from alftrade.factors import FACTOR_NAMES, compute_factor_panel, factor_panel_to_dict
+from alftrade.schema import MARKETDATA_COLUMNS
 
 
 # ── Writing ─────────────────────────────────────────────────────────────
@@ -63,21 +64,7 @@ def write_market_parquet(
 
     for date, day in bars_by_date.items():
         rows = [
-            {
-                "date": b.date,
-                "symbol": b.symbol,
-                "open": b.open,
-                "high": b.high,
-                "low": b.low,
-                "close": b.close,
-                "volume": b.volume,
-                "amount": b.amount,
-                "prev_close": b.prev_close,
-                "limit_up_price": b.limit_up_price,
-                "limit_down_price": b.limit_down_price,
-                "is_suspended": b.is_suspended,
-                "total_shares": b.total_shares,
-            }
+            {c: getattr(b, c) for c in MARKETDATA_COLUMNS}
             for b in day.values()
         ]
         pl.DataFrame(rows).write_parquet(os.path.join(marketdata_dir, f"{date}.parquet"))

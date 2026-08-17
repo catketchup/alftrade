@@ -20,7 +20,14 @@ computed once in a vectorized polars pass over the parquet-read panel, then
 looked up per date by the engine.
 """
 
-from alftrade.data import DailyBar, StockUniverse, generate_simulated_market, bars_to_frame
+from alftrade.data import (
+    DailyBar, StockUniverse, generate_simulated_market,
+    bars_to_frame, frame_to_bars, simulate_to_frame,
+)
+from alftrade.schema import (
+    BAR_COLUMNS, MARKETDATA_COLUMNS, FACTOR_INPUT_COLUMNS,
+    validate_factor_inputs, validate_bar_frame,
+)
 from alftrade.factors import FACTOR_NAMES, compute_factor_panel, factor_panel_to_dict
 from alftrade.engine import Signal, TradingEngine
 from alftrade.portfolio import (
@@ -43,12 +50,20 @@ from alftrade.store import (
     load_factor_panel,
     load_market_with_factors,
 )
+from alftrade.ingest import ingest_parquet, ingest_akshare
 
 __all__ = [
     "DailyBar",
     "StockUniverse",
     "generate_simulated_market",
     "bars_to_frame",
+    "frame_to_bars",
+    "simulate_to_frame",
+    "BAR_COLUMNS",
+    "MARKETDATA_COLUMNS",
+    "FACTOR_INPUT_COLUMNS",
+    "validate_factor_inputs",
+    "validate_bar_frame",
     "FACTOR_NAMES",
     "compute_factor_panel",
     "factor_panel_to_dict",
@@ -76,4 +91,6 @@ __all__ = [
     "load_market_parquet",
     "load_factor_panel",
     "load_market_with_factors",
+    "ingest_parquet",
+    "ingest_akshare",
 ]

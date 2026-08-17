@@ -36,6 +36,8 @@ Usage:
 
 import polars as pl
 
+from alftrade.schema import FACTOR_INPUT_COLUMNS, validate_factor_inputs
+
 
 # Ordered factor names — the canonical ordering used everywhere in the system
 # (calibration, profiler, engine). Code that iterates factors should use this
@@ -71,9 +73,14 @@ def compute_factor_panel(
 ) -> pl.DataFrame:
     """Compute all factors for a long-format panel in one vectorized pass.
 
+    This function is **source-agnostic**: it consumes any long table that
+    satisfies ``schema.FACTOR_INPUT_COLUMNS`` — whether produced by
+    ``data.simulate_to_frame`` (simulated) or ``ingest.ingest_parquet`` (real).
+
     Args:
-        df: Long table with columns ``date, symbol, open, high, low, close,
-            volume, prev_close, market_return`` (extra columns are ignored).
+        df: Long table with the canonical ``schema.FACTOR_INPUT_COLUMNS``
+            (``date, symbol, open, high, low, close, volume, prev_close,
+            market_return``).  Extra columns are ignored.
         sma_window: SMA lookback (default 20).
         vol_window: Volatility lookback (default 20).
         rsi_window: RSI lookback (default 14).
@@ -86,6 +93,7 @@ def compute_factor_panel(
         sorted by ``(symbol, date)``, with warm-up NaNs filled (0.0, or 1.0
         for market_beta).
     """
+    validate_factor_inputs(df.columns)
     df = df.sort(["symbol", "date"])
 
     # Materialize the per-symbol close diff once: RSI needs a *second* window

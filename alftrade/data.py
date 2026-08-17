@@ -36,6 +36,8 @@ from typing import Optional
 
 import numpy as np
 
+from alftrade.schema import BAR_COLUMNS, validate_bar_frame
+
 
 @dataclass
 class DailyBar:
@@ -375,28 +377,73 @@ def _sim_factor_matrix(
 def bars_to_frame(bars_by_date: dict) -> "object":
     """Flatten ``{date: {symbol: DailyBar}}`` into a long-format polars DataFrame.
 
-    One row per (symbol, date) with every ``DailyBar`` field as a column.  This
-    is the input shape for ``factors.compute_factor_panel``.
+    One row per (symbol, date) with every ``DailyBar`` field as a column (the
+    canonical ``schema.BAR_COLUMNS``).  This is the input shape for
+    ``factors.compute_factor_panel``.
     """
     import polars as pl
 
     records = []
     for date, day in bars_by_date.items():
         for sym, b in day.items():
-            records.append({
-                "date": date,
-                "symbol": sym,
-                "open": b.open,
-                "high": b.high,
-                "low": b.low,
-                "close": b.close,
-                "volume": b.volume,
-                "amount": b.amount,
-                "prev_close": b.prev_close,
-                "limit_up_price": b.limit_up_price,
-                "limit_down_price": b.limit_down_price,
-                "is_suspended": b.is_suspended,
-                "total_shares": b.total_shares,
-                "market_return": b.market_return,
-            })
+            # DailyBar field names match BAR_COLUMNS exactly, so drive the
+            # record from the schema to keep the contract in one place.
+            records.append({c: getattr(b, c) for c in BAR_COLUMNS})
     return pl.DataFrame(records)
+
+
+def simulate_to_frame(n_stocks: int = 30, n_days: int = 300, seed: int = 42, **kwargs) -> "object":
+    """Generate simulated data and return it as the canonical long table.
+
+    This is the symmetric counterpart of ``ingest_parquet`` (real data): both
+    return the same long-table schema, so the factor layer and everything
+    downstream are source-agnostic.
+    """
+    bars, _, _ = generate_simulated_market(
+        n_stocks=n_stocks, n_days=n_days, seed=seed, **kwargs)
+    return bars_to_frame(bars)
+
+
+def frame_to_bars(
+    df: "object",
+) -> tuple[dict[int, dict[str, "DailyBar"]], "StockUniverse", dict[int, float]]:
+    """Convert a long-format polars DataFrame back into ``(bars, universe, mkt)``.
+
+    This is the inverse of ``bars_to_frame`` — and the shape returned by
+    ``generate_simulated_market`` — so ingested real data can be consumed by
+    the same pipeline (engine, calibrator, portfolio) as simulated data.
+
+    The DataFrame must have the canonical ``schema.BAR_COLUMNS``.
+    """
+    import polars as pl
+
+    validate_bar_frame(df.columns)
+
+    bars_by_date: dict[int, dict[str, DailyBar]] = {}
+    universe = StockUniverse()
+    market_returns: dict[int, float] = {}
+
+    for (date,), grp in df.group_by("date", maintain_order=True):
+        day: dict[str, DailyBar] = {}
+        for row in grp.iter_rows(named=True):
+            day[row["symbol"]] = DailyBar(
+                date=int(row["date"]),
+                symbol=row["symbol"],
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+                amount=float(row["amount"]),
+                prev_close=float(row["prev_close"]),
+                limit_up_price=float(row["limit_up_price"]),
+                limit_down_price=float(row["limit_down_price"]),
+                is_suspended=bool(row["is_suspended"]),
+                total_shares=float(row["total_shares"]),
+                market_return=float(row["market_return"]),
+            )
+        bars_by_date[int(date)] = day
+        universe.add(int(date), list(day.keys()))
+        market_returns[int(date)] = float(grp["market_return"][0])
+
+    return bars_by_date, universe, market_returns

@@ -9,10 +9,10 @@ from alftrade.factors import FACTOR_NAMES, compute_factor_panel, factor_panel_to
 from alftrade.data import bars_to_frame
 
 
-def _bar(sym, close, prev_close, suspended=False):
+def _bar(sym, close, prev_close, date=1, suspended=False):
     up, dn = compute_limit_prices(prev_close, 0.10)
     return DailyBar(
-        date=1, symbol=sym, open=prev_close, high=close, low=close, close=close,
+        date=date, symbol=sym, open=prev_close, high=close, low=close, close=close,
         volume=1000.0, amount=close * 1000.0, prev_close=prev_close,
         limit_up_price=up, limit_down_price=dn, is_suspended=suspended,
     )
@@ -26,7 +26,7 @@ def _panel(date, prices, prev_closes=None, suspended=None):
     if suspended is None:
         suspended = {s: False for s in syms}
     return {
-        s: _bar(s, prices[s], prev_closes.get(s, prices[s]), suspended[s])
+        s: _bar(s, prices[s], prev_closes.get(s, prices[s]), date=date, suspended=suspended[s])
         for s in syms
     }
 

@@ -5,6 +5,7 @@ alftrade/data.py
 alftrade/engine.py
 alftrade/factors.py
 alftrade/hedge.py
+alftrade/ingest.py
 alftrade/portfolio.py
 alftrade/profiler.py
 alftrade/risk.py
@@ -19,6 +20,7 @@ tests/test_data.py
 tests/test_engine.py
 tests/test_factors.py
 tests/test_hedge.py
+tests/test_ingest.py
 tests/test_portfolio.py
 tests/test_profiler.py
 tests/test_risk.py
