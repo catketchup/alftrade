@@ -158,6 +158,20 @@ def test_sell_cannot_create_short():
     assert pos.is_flat
 
 
+def test_trade_pnl_is_recorded():
+    """apply_trade records the net realized PnL on the Trade (used by the
+    daily-loss monitor)."""
+    pos = Position()
+    buy = Trade(1, "A", 100.0, 100, "OPEN", cost=2.5)
+    pos.apply_trade(buy)
+    assert buy.pnl == pytest.approx(-2.5)   # buy cost is a cash outflow
+
+    pos.rollover_t1()
+    sell = Trade(2, "A", 105.0, -100, "CLOSE", cost=10.0)
+    pos.apply_trade(sell)
+    assert sell.pnl == pytest.approx(5.0 * 100 - 10.0)  # (105-100)*100 - cost
+
+
 # ── Position.mark_to_market ────────────────────────────────────────────
 
 def test_mark_to_market_long():
@@ -288,7 +302,7 @@ def _pm(capital=1_000_000.0, n_holdings=3, **kw):
     """Build a PortfolioManager with a permissive risk config for unit tests."""
     from alftrade.risk import RiskManager, RiskConfig
     cfg = RiskConfig(
-        enforce_t1=True, enforce_lot=True, reject_limit_locked=True,
+        enforce_lot=True, reject_limit_locked=True,
         reject_suspended=True, max_weight_per_name=0.5,
         max_notional_per_trade=None, max_trades_per_day=None,
         stop_loss_pct=None, take_profit_pct=None,

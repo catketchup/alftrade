@@ -1,8 +1,11 @@
 """Tests for risk.py: all A-share pre-trade and post-bar risk rules.
 
-Pre-trade:  suspension, limit-lock, T+1, board lot, concentration,
+Pre-trade:  suspension, limit-lock, board lot, concentration,
             notional cap, order frequency, circuit breaker.
 Post-bar:   stop-loss, take-profit, max drawdown, daily loss limit.
+
+(T+1 is enforced at execution time by ``Position.apply_trade`` — see
+``test_portfolio.py`` — not by the pre-trade gate.)
 """
 
 import pytest
@@ -26,7 +29,7 @@ def _bar(sym, close, prev_close=None, suspended=False, limit_pct=0.10):
 def _cfg(**overrides):
     """A permissive config; tests enable one rule at a time via overrides."""
     base = dict(
-        enforce_t1=True, enforce_lot=True, reject_limit_locked=True,
+        enforce_lot=True, reject_limit_locked=True,
         reject_suspended=True, max_weight_per_name=None,
         max_notional_per_trade=None, max_trades_per_day=None,
         stop_loss_pct=None, take_profit_pct=None,
@@ -79,40 +82,6 @@ def test_limit_up_allows_sells():
     pf.positions["A"].t1_locked = 0  # make sellable
     result = rm.check_pre_trade({"A": bar}, Trade(1, "A", 110.0, -100, "CLOSE"), pf)
     assert result is not None
-
-
-# ── Pre-trade: T+1 ─────────────────────────────────────────────────────
-
-def test_t1_caps_sell_to_available():
-    """A sell exceeding available_qty is shrunk, not rejected."""
-    rm = RiskManager(_cfg())
-    bar = _bar("A", 100.0)
-    pf = Portfolio(cash=0.0, positions={"A": Position(quantity=200, avg_entry_price=100.0)})
-    # 100 shares locked (bought today), 100 available.
-    pf.positions["A"].t1_locked = 100
-    result = rm.check_pre_trade({"A": bar}, Trade(1, "A", 100.0, -200, "CLOSE"), pf)
-    assert result is not None
-    assert result.quantity == -100   # shrunk to available_qty
-
-
-def test_t1_rejects_when_nothing_available():
-    """A sell when available_qty = 0 is rejected."""
-    rm = RiskManager(_cfg())
-    bar = _bar("A", 100.0)
-    pf = Portfolio(cash=0.0, positions={"A": Position(quantity=100, avg_entry_price=100.0)})
-    pf.positions["A"].t1_locked = 100  # all locked
-    assert rm.check_pre_trade({"A": bar}, Trade(1, "A", 100.0, -100, "CLOSE"), pf) is None
-
-
-def test_t1_disabled_allows_full_sell():
-    """With enforce_t1=False, sells are not capped by available_qty."""
-    rm = RiskManager(_cfg(enforce_t1=False))
-    bar = _bar("A", 100.0)
-    pf = Portfolio(cash=0.0, positions={"A": Position(quantity=100, avg_entry_price=100.0)})
-    pf.positions["A"].t1_locked = 100
-    result = rm.check_pre_trade({"A": bar}, Trade(1, "A", 100.0, -100, "CLOSE"), pf)
-    assert result is not None
-    assert result.quantity == -100
 
 
 # ── Pre-trade: board lot ───────────────────────────────────────────────
@@ -208,12 +177,13 @@ def test_order_frequency_resets_next_day():
 # ── Pre-trade: circuit breaker ─────────────────────────────────────────
 
 def test_circuit_breaker_blocks_opens():
-    """When halted, new OPEN buys are rejected."""
+    """When halted, new buys are rejected (any direction)."""
     rm = RiskManager(_cfg())
     rm.halted = True
     bar = _bar("A", 100.0)
     pf = Portfolio(cash=1_000_000.0)
     assert rm.check_pre_trade({"A": bar}, Trade(1, "A", 100.0, 100, "OPEN"), pf) is None
+    assert rm.check_pre_trade({"A": bar}, Trade(1, "A", 100.0, 100, "INCREASE"), pf) is None
 
 
 def test_circuit_breaker_allows_closes():

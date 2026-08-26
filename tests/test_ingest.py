@@ -5,7 +5,7 @@ import os
 import polars as pl
 import pytest
 
-from alftrade.ingest import ingest_parquet, STANDARD_COLUMNS
+from alftrade.ingest import ingest_parquet, STANDARD_COLUMNS, limit_pct_for_symbol
 from alftrade import frame_to_bars, bars_to_frame, generate_simulated_market
 
 
@@ -113,3 +113,55 @@ def test_frame_to_bars_roundtrip():
         assert l.limit_down_price == o.limit_down_price
         assert l.is_suspended == o.is_suspended
         assert l.total_shares == o.total_shares
+
+
+# ── Board-specific price limits ────────────────────────────────────────
+
+def test_limit_pct_for_symbol_boards():
+    """Board-specific limits: 10% main, 20% STAR/ChiNext, 30% BSE."""
+    assert limit_pct_for_symbol("600000.SH") == 0.10   # Shanghai main
+    assert limit_pct_for_symbol("000001.SZ") == 0.10   # Shenzhen main
+    assert limit_pct_for_symbol("002384.SZ") == 0.10   # SME board
+    assert limit_pct_for_symbol("688072.SH") == 0.20   # STAR
+    assert limit_pct_for_symbol("300251.SZ") == 0.20   # ChiNext
+    assert limit_pct_for_symbol("301165.SZ") == 0.20   # ChiNext (301)
+    assert limit_pct_for_symbol("830000.BJ") == 0.30   # BSE
+    assert limit_pct_for_symbol("430047") == 0.30      # BSE bare code
+
+
+def test_limit_pct_for_symbol_bare_code():
+    """A bare 6-digit code works without an exchange suffix."""
+    assert limit_pct_for_symbol("600000") == 0.10
+    assert limit_pct_for_symbol("688072") == 0.20
+
+
+def test_ingest_derives_board_specific_limits(tmp_path):
+    """limit_up/down prices use the board-specific fraction per symbol."""
+    rows = [
+        {"date": "2024-09-02", "symbol": "600000.SH", "open": 10.0, "high": 10.2,
+         "low": 9.9, "close": 10.0, "volume": 1000.0, "amount": 10000.0},
+        {"date": "2024-09-02", "symbol": "688072.SH", "open": 100.0, "high": 101.0,
+         "low": 99.0, "close": 100.0, "volume": 1000.0, "amount": 100000.0},
+        {"date": "2024-09-03", "symbol": "600000.SH", "open": 10.0, "high": 10.2,
+         "low": 9.9, "close": 10.0, "volume": 1000.0, "amount": 10000.0},
+        {"date": "2024-09-03", "symbol": "688072.SH", "open": 100.0, "high": 101.0,
+         "low": 99.0, "close": 100.0, "volume": 1000.0, "amount": 100000.0},
+    ]
+    os.makedirs(os.path.join(str(tmp_path)), exist_ok=True)
+    df = pl.DataFrame(rows).with_columns(
+        pl.col("date").str.to_datetime("%Y-%m-%d").alias("datetime")
+    ).rename({"symbol": "stock_code"})
+    for (date_str,), day in df.group_by("date", maintain_order=True):
+        day.select(["datetime", "stock_code", "open", "high", "low", "close",
+                    "volume", "amount"]).write_parquet(
+            os.path.join(str(tmp_path), f"{date_str}.parquet"))
+
+    out = ingest_parquet(str(tmp_path)).sort(["symbol", "date"])
+    # 600000 (main board): prev_close=10 on day 2 → limit_up = 10*1.10 = 11.00
+    m600 = out.filter(pl.col("symbol") == "600000.SH").sort("date")
+    assert m600["limit_up_price"][1] == pytest.approx(round(10.0 * 1.10, 2))
+    assert m600["limit_down_price"][1] == pytest.approx(round(10.0 * 0.90, 2))
+    # 688072 (STAR): prev_close=100 on day 2 → limit_up = 100*1.20 = 120.00
+    s688 = out.filter(pl.col("symbol") == "688072.SH").sort("date")
+    assert s688["limit_up_price"][1] == pytest.approx(round(100.0 * 1.20, 2))
+    assert s688["limit_down_price"][1] == pytest.approx(round(100.0 * 0.80, 2))

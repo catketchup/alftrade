@@ -10,13 +10,16 @@ Sits between the PortfolioManager's rebalance decisions and the portfolio's
      A-share-specific rules that don't exist in hftrade:
         - Suspension: reject all trades on halted symbols.
         - Price-limit lock: reject buys at limit-up, sells at limit-down.
-        - T+1 settlement: shrink sells to ``available_qty``.
         - Board lot: reject/shrink buys that aren't a multiple of 100.
         - Single-name concentration: shrink buys that would breach
           ``max_weight_per_name``.
         - Notional cap: shrink any trade exceeding ``max_notional_per_trade``.
         - Order frequency: reject once ``max_trades_per_day`` is hit.
         - Circuit breaker: reject new opens when the portfolio is halted.
+
+     (T+1 settlement is *not* a pre-trade rule — it is enforced at execution
+     time by ``Position.apply_trade``, after the daily rollover, so that
+     next-open execution is not wrongly delayed by a stale ``available_qty``.)
 
   2. ``check_post_bar(date, bars, portfolio)`` — monitor after the rebalance.
         - Per-position stop-loss / take-profit (pct of position cost).
@@ -51,7 +54,8 @@ class RiskConfig:
     Defaults are pedagogical — realistic but not aggressive.
     """
     # ── Pre-trade: A-share structural rules ──
-    enforce_t1: bool = True                    # Block same-day sells of today's buys
+    # (T+1 is not a pre-trade rule — it is enforced at execution time by
+    #  Position.apply_trade, after the daily rollover.)
     enforce_lot: bool = True                   # Buys must be a multiple of BOARD_LOT
     reject_limit_locked: bool = True           # Reject buys at limit-up, sells at limit-down
     reject_suspended: bool = True              # Reject all trades on halted symbols
@@ -126,22 +130,18 @@ class RiskManager:
             if trade.quantity < 0 and bar.is_limit_down:
                 return None
 
-        # Circuit breaker: when halted, block new opens (closes still allowed).
-        if self.halted and trade.quantity > 0 and trade.direction == "OPEN":
+        # Circuit breaker: when halted, block ALL buys (new opens AND adds to
+        # existing positions — a halted account only liquidates). Closes pass.
+        if self.halted and trade.quantity > 0:
             return None
 
-        # T+1: cap sells by available quantity.
-        if cfg.enforce_t1 and trade.quantity < 0:
-            pos = portfolio.get(trade.symbol)
-            if pos.available_qty < abs(trade.quantity):
-                sellable = int(pos.available_qty)
-                if sellable <= 0:
-                    return None
-                trade = Trade(
-                    date=trade.date, symbol=trade.symbol, price=price,
-                    quantity=-sellable, direction=trade.direction,
-                    cost=trade.cost, pnl=trade.pnl, reason=trade.reason,
-                )
+        # NOTE: T+1 is NOT enforced here.  It is an execution-time constraint
+        # (can I sell these shares *today*?) and is applied by
+        # ``Position.apply_trade`` when the fill settles, after the daily
+        # rollover.  Enforcing it at plan time would use a stale
+        # ``available_qty`` (the shares bought at today's open are still locked
+        # at the close, but will be unlocked by the next open's rollover) and
+        # wrongly delay next-open sells by a day.
 
         # Board lot: buys must be multiples of 100.
         if cfg.enforce_lot and trade.quantity > 0:
@@ -215,12 +215,13 @@ class RiskManager:
         bars: dict[str, DailyBar],
         portfolio: "Portfolio",
     ) -> list[Trade]:
-        """Run all post-bar monitors; return forced-close trades.
+        """Run all post-bar monitors; return force-close *orders*.
 
         Checks (in order): per-position stop-loss → per-position take-profit
-        → portfolio max-drawdown → daily loss limit. The first two may
-        produce multiple forced closes (one per offending position); the
-        latter two halt the system and close everything still held.
+        → portfolio max-drawdown → daily loss limit.  This is **decide-only**:
+        the returned trades are orders to execute at the next open, not fills.
+        The caller applies them (via ``PortfolioManager.settle``) and reports
+        the realized PnL back through ``accumulate_realized``.
         """
         self._maybe_rollover_day(date)
         cfg = self.config
@@ -244,14 +245,8 @@ class RiskManager:
             if cfg.take_profit_pct is not None and pnl_pct > cfg.take_profit_pct:
                 forced.append(self._force_close(date, sym, price, pos, "TAKE_PROFIT"))
 
-        # Apply any per-position forced closes to the portfolio before
-        # evaluating portfolio-level drawdown / daily loss, so the equity
-        # used for those checks reflects them.
-        for t in forced:
-            portfolio.apply_trade(t)
-            self._daily_realized += t.pnl
-
-        # Re-mark equity after the forced closes.
+        # Mark-to-market equity (do NOT apply the forced closes — they execute
+        # at the next open).
         equity = portfolio.cash + sum(
             p.quantity * (bars[s].close if s in bars else p.avg_entry_price)
             for s, p in portfolio.positions.items() if p.quantity > 0
@@ -288,6 +283,42 @@ class RiskManager:
 
         return forced
 
+    def accumulate_realized(self, pnl: float) -> None:
+        """Record realized PnL from a fill for the daily-loss monitor."""
+        self._daily_realized += pnl
+
+    def to_state(self) -> dict:
+        """JSON-serializable snapshot of the running risk state.
+
+        The ``config`` is not serialized (it is a constructor argument) —
+        ``from_state`` takes it explicitly.
+        """
+        return {
+            "peak_equity": self.peak_equity,
+            "halted": self.halted,
+            "trades_today": self._trades_today,
+            "current_date": self._current_date,
+            "daily_realized": self._daily_realized,
+            "initial_capital": self.initial_capital,
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: dict,
+        config: Optional[RiskConfig] = None,
+        initial_capital: Optional[float] = None,
+    ) -> "RiskManager":
+        rm = cls(config=config, initial_capital=initial_capital)
+        rm.peak_equity = state.get("peak_equity", 0.0)
+        rm.halted = state.get("halted", False)
+        rm._trades_today = state.get("trades_today", 0)
+        rm._current_date = state.get("current_date")
+        rm._daily_realized = state.get("daily_realized", 0.0)
+        if state.get("initial_capital") is not None and initial_capital is None:
+            rm.initial_capital = state["initial_capital"]
+        return rm
+
     # ── Helpers ─────────────────────────────────────────────────────
 
     def record_trade(self, date: int, symbol: str) -> None:
@@ -303,13 +334,17 @@ class RiskManager:
             self._daily_realized = 0.0
 
     def _force_close(self, date: int, symbol: str, price: float, pos: "Position", reason: str) -> Trade:
-        """Build a forced-close trade for an entire open position."""
-        # T+1: only sell what's available today.
-        qty = pos.available_qty
+        """Build a forced-close trade for an entire open position.
+
+        Uses the full ``quantity`` (not ``available_qty``): T+1 is an
+        execution-time constraint enforced by ``Position.apply_trade`` after
+        the daily rollover, so capping here would emit a zero/partial order
+        that never actually closes the position.
+        """
         direction = "CLOSE"
         return Trade(
             date=date, symbol=symbol, price=price,
-            quantity=-qty, direction=direction,
+            quantity=-pos.quantity, direction=direction,
             reason=reason,
         )
 

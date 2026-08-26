@@ -144,9 +144,9 @@ class CalibrationResult:
 
     # ── Persistence ──────────────────────────────────────────────────
 
-    def save(self, path: str) -> None:
-        """Save to JSON for the offline → online handoff."""
-        data = {
+    def to_state(self) -> dict:
+        """JSON-serializable dict (the same shape ``save`` writes)."""
+        return {
             "horizon": self.horizon,
             "alpha": self.alpha,
             "method": self.method,
@@ -163,14 +163,9 @@ class CalibrationResult:
             "n_dates": self.n_dates,
             "calibrated_at": self.calibrated_at,
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
 
     @classmethod
-    def load(cls, path: str) -> "CalibrationResult":
-        """Restore a CalibrationResult previously saved by save()."""
-        with open(path, "r") as f:
-            d = json.load(f)
+    def from_state(cls, d: dict) -> "CalibrationResult":
         return cls(
             horizon=d["horizon"],
             alpha=d["alpha"],
@@ -188,6 +183,18 @@ class CalibrationResult:
             n_dates=d["n_dates"],
             calibrated_at=d.get("calibrated_at", ""),
         )
+
+    def save(self, path: str) -> None:
+        """Save to JSON for the offline → online handoff."""
+        with open(path, "w") as f:
+            json.dump(self.to_state(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "CalibrationResult":
+        """Restore a CalibrationResult previously saved by save()."""
+        with open(path, "r") as f:
+            d = json.load(f)
+        return cls.from_state(d)
 
 
 class FactorCalibrator:

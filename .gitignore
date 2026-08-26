@@ -1,0 +1,9 @@
+# Generated data caches (simulated parquet-by-date panels)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/

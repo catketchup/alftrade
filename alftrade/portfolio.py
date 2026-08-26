@@ -84,6 +84,14 @@ class CostModel:
         stamp = notional * self.stamp_duty_bps if side == "SELL" else 0.0
         return commission + transfer + stamp
 
+    def fee_breakdown(self, side: str, price: float, quantity: float) -> dict:
+        """Return {commission, transfer, stamp} (yuan) for reporting."""
+        notional = price * quantity
+        commission = max(notional * self.commission_bps, self.min_commission) if quantity > 0 else 0.0
+        transfer = notional * self.transfer_fee_bps if quantity > 0 else 0.0
+        stamp = notional * self.stamp_duty_bps if side == "SELL" and quantity > 0 else 0.0
+        return {"commission": commission, "transfer": transfer, "stamp": stamp}
+
 
 # ── Trade & Position ────────────────────────────────────────────────────
 
@@ -117,6 +125,24 @@ class Trade:
         return (f"Trade({self.date} {self.symbol} {self.direction} "
                 f"qty={self.quantity:+.0f} @ {self.price:.2f} "
                 f"cost={self.cost:.2f} pnl={self.pnl:.2f} [{self.reason}])")
+
+    def to_dict(self) -> dict:
+        """JSON-serializable snapshot (used for the paper-trading state file
+        and the trades ledger)."""
+        return {
+            "date": self.date, "symbol": self.symbol, "price": self.price,
+            "quantity": self.quantity, "direction": self.direction,
+            "cost": self.cost, "pnl": self.pnl, "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Trade":
+        return cls(
+            date=d["date"], symbol=d["symbol"], price=d["price"],
+            quantity=d["quantity"], direction=d["direction"],
+            cost=d.get("cost", 0.0), pnl=d.get("pnl", 0.0),
+            reason=d.get("reason", "SIGNAL"),
+        )
 
 
 @dataclass
@@ -157,6 +183,26 @@ class Position:
         """Clear the T+1 lock: yesterday's buys become sellable today."""
         self.t1_locked = 0.0
 
+    def to_state(self) -> dict:
+        """JSON-serializable snapshot of the position."""
+        return {
+            "quantity": self.quantity,
+            "avg_entry_price": self.avg_entry_price,
+            "t1_locked": self.t1_locked,
+            "realized_pnl": self.realized_pnl,
+            "unrealized_pnl": self.unrealized_pnl,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Position":
+        return cls(
+            quantity=state.get("quantity", 0.0),
+            avg_entry_price=state.get("avg_entry_price", 0.0),
+            t1_locked=state.get("t1_locked", 0.0),
+            realized_pnl=state.get("realized_pnl", 0.0),
+            unrealized_pnl=state.get("unrealized_pnl", 0.0),
+        )
+
     def apply_trade(self, trade: Trade) -> None:
         """Update position state after a trade fill (long-only).
 
@@ -175,17 +221,18 @@ class Position:
             self.avg_entry_price = total_cost / self.quantity if self.quantity > 0 else 0.0
             self.t1_locked += trade.quantity
             self.realized_pnl -= trade.cost
-            if trade.direction == "OPEN":
-                pass  # opening, no PnL
+            trade.pnl = -trade.cost   # buy cost is a realized cash outflow
             return
 
         # Sell: long-only, cannot sell more than available_qty (T+1).
         sell_qty = min(-trade.quantity, self.available_qty)
         if sell_qty <= 0:
+            trade.pnl = 0.0
             return  # nothing sellable today (T+1 blocked)
 
         pnl_per_share = trade.price - self.avg_entry_price
         self.realized_pnl += pnl_per_share * sell_qty - trade.cost
+        trade.pnl = pnl_per_share * sell_qty - trade.cost
         self.quantity -= sell_qty
         # Sells draw from the non-locked portion first; t1_locked only
         # decreases if the sell exceeded the unlocked shares (shouldn't
@@ -260,6 +307,23 @@ class Portfolio:
         """Clear T+1 locks on every position (call at the start of a new day)."""
         for pos in self.positions.values():
             pos.rollover_t1()
+
+    def to_state(self) -> dict:
+        """JSON-serializable snapshot of cash + positions."""
+        return {
+            "cash": self.cash,
+            "initial_capital": self.initial_capital,
+            "positions": {s: p.to_state() for s, p in self.positions.items()},
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Portfolio":
+        pf = cls(cash=state.get("cash", 0.0),
+                 initial_capital=state.get("initial_capital", 0.0))
+        pf.positions = {
+            s: Position.from_state(ps) for s, ps in state.get("positions", {}).items()
+        }
+        return pf
 
     @property
     def total_pnl(self) -> float:
@@ -415,72 +479,137 @@ class PortfolioManager:
         # must NOT unlock same-day purchases).
         self._last_date: Optional[int] = None
 
+    def to_state(self) -> dict:
+        """JSON-serializable snapshot of the manager (portfolio + trades +
+        risk state + decision date).  Config fields (aggregator, cost model)
+        are reconstructed by the caller, so they are not serialized."""
+        return {
+            "capital": self.capital,
+            "n_holdings": self.n_holdings,
+            "weighting": self.weighting,
+            "top_quantile": self.top_quantile,
+            "last_date": self._last_date,
+            "portfolio": self.portfolio.to_state(),
+            "trades": [t.to_dict() for t in self.trades],
+            "risk": self.risk.to_state(),
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: dict,
+        aggregator: Optional["SignalAggregator"] = None,
+        cost_model: Optional[CostModel] = None,
+        risk_config=None,
+    ) -> "PortfolioManager":
+        """Rebuild a manager from ``to_state`` output.
+
+        Args:
+            state: Snapshot dict produced by ``to_state``.
+            aggregator: Reconstructed signal aggregator (e.g. carrying the
+                stored calibration); defaults to a fresh one.
+            cost_model: Reconstructed cost model; defaults to ``CostModel()``.
+            risk_config: RiskConfig to rebuild the RiskManager; the snapshot's
+                running risk state (peak equity, halt flag, ...) is restored.
+        """
+        from alftrade.risk import RiskConfig, RiskManager
+
+        pm = cls(
+            capital=state.get("capital"),
+            n_holdings=state.get("n_holdings", 10),
+            weighting=state.get("weighting", "equal"),
+            aggregator=aggregator,
+            cost_model=cost_model or CostModel(),
+            top_quantile=state.get("top_quantile"),
+        )
+        pm.portfolio = Portfolio.from_state(state["portfolio"])
+        pm.trades = [Trade.from_dict(t) for t in state.get("trades", [])]
+        pm._last_date = state.get("last_date")
+        risk_state = state.get("risk")
+        if risk_state is not None:
+            pm.risk = RiskManager.from_state(
+                risk_state,
+                config=risk_config or RiskConfig(),
+                initial_capital=pm.portfolio.initial_capital,
+            )
+        return pm
+
+    def settle(self, date: int, fills: list[Trade]) -> list[Trade]:
+        """Apply executed fills (at ``date``'s open) to the portfolio.
+
+        Rolls T+1 locks forward first (only when the date advances), then
+        applies each fill and records its realized PnL for the daily-loss
+        monitor.  This is the execution-side half of the two-phase flow; the
+        decision side is ``plan``.
+        """
+        if self._last_date != date:
+            self.portfolio.rollover_t1()
+            self._last_date = date
+        executed: list[Trade] = []
+        for fill in fills:
+            self.portfolio.apply_trade(fill)
+            self.risk.record_trade(date, fill.symbol)
+            self.risk.accumulate_realized(fill.pnl)
+            self.trades.append(fill)
+            executed.append(fill)
+        return executed
+
+    def plan(
+        self,
+        date: int,
+        bars: dict[str, DailyBar],
+        signals_by_symbol: dict[str, list[Signal]],
+    ) -> list[Trade]:
+        """Compute target orders at ``date``'s close (rebalance + risk).
+
+        Returns the *orders* to execute at the next open: rebalance trades
+        (passed through the pre-trade gate) plus any force-close orders from
+        the post-bar risk monitor.  Nothing is applied here — execution is
+        deferred to the ``Broker`` (next-open) or the same-bar ``decide``.
+        """
+        equity = self.portfolio.mark_to_market(bars)
+        capital = self.capital or equity
+
+        composites = self.aggregator.aggregate_all(signals_by_symbol)
+        targets = self._target_weights(composites, bars, capital)
+        proposed = self._propose_trades(date, bars, targets, capital)
+
+        orders: list[Trade] = []
+        for trade in proposed:
+            approved = self.risk.check_pre_trade(bars, trade, self.portfolio)
+            if approved is not None:
+                orders.append(approved)
+
+        forced = self.risk.check_post_bar(date, bars, self.portfolio)
+        # Force-close orders (stop-loss / drawdown / daily-loss) override any
+        # rebalance order for the same symbol — never both buy and sell a name,
+        # and never emit two sell orders for the same position.
+        forced_syms = {t.symbol for t in forced}
+        orders = [o for o in orders if o.symbol not in forced_syms]
+        orders.extend(forced)
+        return orders
+
     def decide(
         self,
         date: int,
         bars: dict[str, DailyBar],
         signals_by_symbol: dict[str, list[Signal]],
     ) -> list[Trade]:
-        """Run one day's rebalance: aggregate → target weights → trades.
+        """Same-bar convenience: plan at ``date``'s close and execute at close.
 
-        Pipeline:
-          1. Rollover T+1 locks (yesterday's buys are now sellable).
-          2. Mark every position to market at today's close.
-          3. Aggregate per-stock signals → composite scores.
-          4. Build target weights from top-scored stocks.
-          5. Generate proposed buy/sell trades to reach targets.
-          6. Pass each through RiskManager.check_pre_trade (may reject/shrink).
-          7. Execute approved trades on the portfolio.
-          8. Run RiskManager.check_post_bar (stop-loss / drawdown / etc.).
+        Keeps the original (look-ahead-biased) behavior for quick backtests.
+        The realistic next-open path is ``Trader.step`` + ``Broker``.
         """
-        # 1. New day: clear T+1 locks — but only when the date advances.
-        #    Calling decide() twice on the same date must NOT unlock same-day
-        #    purchases (T+1 is a calendar rule, not a call-frequency rule).
         if self._last_date != date:
             self.portfolio.rollover_t1()
             self._last_date = date
-
-        # 2. Mark to market.
-        equity = self.portfolio.mark_to_market(bars)
-        capital = self.capital or equity
-
-        # 3. Aggregate.
-        composites = self.aggregator.aggregate_all(signals_by_symbol)
-
-        # 4. Target weights.
-        targets = self._target_weights(composites, bars, capital)
-
-        # 5. Proposed trades: sells first (free up cash), then buys.
-        proposed = self._propose_trades(date, bars, targets, capital)
-        executed: list[Trade] = []
-
-        # 6-7. Pre-trade risk gate + execution.
-        for trade in proposed:
-            approved = self.risk.check_pre_trade(bars, trade, self.portfolio)
-            if approved is not None:
-                # Re-price cost after any qty shrink the risk manager did.
-                side = "BUY" if approved.quantity > 0 else "SELL"
-                approved.cost = self.cost_model.cost(side, approved.price, abs(approved.quantity))
-                self.portfolio.apply_trade(approved)
-                self.risk.record_trade(date, approved.symbol)
-                self.trades.append(approved)
-                executed.append(approved)
-
-        # Re-mark after signal-driven trades.
-        self.portfolio.mark_to_market(bars)
-
-        # 8. Post-bar risk monitor (may force-close positions).
-        forced = self.risk.check_post_bar(date, bars, self.portfolio)
-        for ft in forced:
-            side = "SELL"
-            ft.cost = self.cost_model.cost(side, ft.price, abs(ft.quantity))
-            self.portfolio.apply_trade(ft)
-            self.risk.record_trade(date, ft.symbol)
-            self.trades.append(ft)
-            executed.append(ft)
-
-        self.portfolio.mark_to_market(bars)
-        return executed
+        orders = self.plan(date, bars, signals_by_symbol)
+        fills: list[Trade] = []
+        for order in orders:
+            side = "BUY" if order.quantity > 0 else "SELL"
+            order.cost = self.cost_model.cost(side, order.price, abs(order.quantity))
+            fills.append(order)
+        return self.settle(date, fills)
 
     def _target_weights(
         self,
@@ -542,6 +671,10 @@ class PortfolioManager:
             return []
 
         # ── Sells: drop names not in targets, or trim overweight ones ──
+        # NOTE: sell sizes use the full ``quantity``, not ``available_qty``.
+        # T+1 is an execution-time constraint enforced by ``Position.apply_trade``
+        # (after the daily rollover); capping here would use a stale
+        # ``available_qty`` and wrongly skip/delay next-open sells.
         for sym, pos in list(self.portfolio.positions.items()):
             if pos.quantity <= 0:
                 continue
@@ -550,11 +683,10 @@ class PortfolioManager:
             current_value = pos.quantity * price
             if current_value > target_value + 1e-6:
                 excess_value = current_value - target_value
-                # Cap sell by T+1 availability.
-                sell_shares = min(excess_value / price, pos.available_qty)
+                sell_shares = excess_value / price
                 # If fully dropping the name, allow selling down to 0 (odd lot ok).
                 if target_value <= 1e-6:
-                    sell_shares = min(pos.quantity, pos.available_qty)
+                    sell_shares = pos.quantity
                 sell_shares = int(sell_shares)  # whole shares only
                 if sell_shares > 0:
                     direction = "CLOSE" if target_value <= 1e-6 else "REDUCE"

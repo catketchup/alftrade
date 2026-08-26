@@ -154,8 +154,12 @@ class ParquetPanel(Mapping):
         return bars
 
 
-def _read_long(root: str) -> pl.DataFrame:
-    """Read all marketdata + index into a single long table joined on date."""
+def read_market_frame(root: str) -> pl.DataFrame:
+    """Read all marketdata + index into a single long table (canonical schema).
+
+    Joins the per-date marketdata parquet with the index on ``date``, yielding
+    one row per (symbol, date) with every ``schema.BAR_COLUMNS``.
+    """
     market = pl.scan_parquet(os.path.join(root, "marketdata", "*.parquet"))
     index = pl.scan_parquet(os.path.join(root, "index.parquet"))
     return market.join(index, on="date", how="left").collect()
@@ -188,7 +192,7 @@ def load_factor_panel(root: str) -> dict[int, dict[str, dict[str, float]]]:
 
     Returns ``{date: {symbol: {factor: value}}}`` ready for the TradingEngine.
     """
-    long_df = _read_long(root)
+    long_df = read_market_frame(root)
     factor_df = compute_factor_panel(long_df)
     return factor_panel_to_dict(factor_df)
 
