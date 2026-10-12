@@ -148,3 +148,31 @@ def test_show_cron_prints_line(capsys):
     out = capsys.readouterr().out
     assert "python -m alftrade.paper" in out
     assert "csi300:30" in out
+
+
+def test_show_cron_includes_export_dir(capsys):
+    assert main(["--show-cron", "--state-dir", "x", "--pool", "csi300:30",
+                 "--export-dir", "data/orders"]) == 0
+    out = capsys.readouterr().out
+    assert "--export-dir data/orders" in out
+
+
+def test_export_dir_writes_ptrade_order_files(panel, pdates, tmp_path):
+    """Shadow-book mode: the close-time plan of each day is exported, and the
+    very last day (no next trading day) is skipped."""
+    export_dir = tmp_path / "orders"
+    cfg = _cfg(tmp_path, export_dir=str(export_dir))
+    pt = _paper(cfg, panel)
+    s = pt.run()
+    exported = [d for d in os.listdir(str(export_dir))]
+    # every processed day except the last has a next trading day
+    assert len(exported) == max(s["processed_days"] - 1, 0)
+    if exported:
+        day_dir = os.path.join(str(export_dir), sorted(exported)[0])
+        assert os.path.isfile(os.path.join(day_dir, "orders.csv"))
+        assert os.path.isfile(os.path.join(day_dir, "orders.json"))
+        assert os.path.isfile(os.path.join(day_dir, "target_positions.csv"))
+        with open(os.path.join(day_dir, "orders.csv"),
+                  encoding="utf-8-sig") as f:
+            header = f.readline()
+        assert header.startswith("plan_date,exec_date,symbol")

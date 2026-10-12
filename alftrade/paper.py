@@ -11,6 +11,10 @@ Bridges the offline backtest (demo.ipynb) and a live account:
     strategy resumes exactly where it stopped.
   * **Artifacts**: an append-only trades ledger (``trades.csv``) and one
     markdown daily report per trading day (``reports/YYYYMMDD.md``).
+  * **ptrade bridge**: with ``--export-dir data/orders``, every close-time
+    plan is also exported as order files (``data/orders/<date>/orders.csv``)
+    for a ptrade-side strategy to execute next morning (shadow-book mode —
+    the simulation itself keeps running).
   * **Model upkeep**: the Fama-MacBeth calibration refits automatically every
     ``refit_days`` new trading days, using only data available at that time.
 
@@ -33,8 +37,11 @@ import polars as pl
 from alftrade.broker import Broker, ExecutionConfig
 from alftrade.calibration import CalibrationResult, FactorCalibrator
 from alftrade.data import frame_to_bars
-from alftrade.datasource import fetch_daily_to_parquet, load_panel, resolve_symbols
+from alftrade.datasource import (
+    fetch_daily_to_parquet, load_panel, resolve_symbols, symbol_names,
+)
 from alftrade.engine import TradingEngine
+from alftrade.export_ptrade import export_ptrade_orders
 from alftrade.factors import compute_factor_panel, factor_panel_to_dict
 from alftrade.portfolio import CostModel, PortfolioManager, SignalAggregator
 from alftrade.report import daily_report, write_ledger
@@ -61,6 +68,7 @@ class PaperConfig:
     refit_days: int = 30
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    export_dir: Optional[str] = None
 
 
 class PanelUpdater:
@@ -196,6 +204,24 @@ class PaperTrader:
             with open(os.path.join(self._reports_dir, f"{d}.md"), "w") as f:
                 f.write(report)
 
+            # Shadow-book mode: also export the close-time plan for ptrade to
+            # execute at the next open (the simulation keeps running as usual).
+            if cfg.export_dir:
+                i = dates.index(d)
+                next_date = dates[i + 1] if i + 1 < len(dates) else None
+                names = symbol_names(sorted({t.symbol for t in trader.pending}))
+                path = export_ptrade_orders(
+                    orders=trader.pending,
+                    plan_date=d,
+                    exec_date=next_date,
+                    bars=bars[d],
+                    portfolio=trader.portfolio.portfolio,
+                    out_dir=cfg.export_dir,
+                    names=names,
+                )
+                if path:
+                    print(f"[paper] exported ptrade orders → {path}")
+
             equity = trader.portfolio.portfolio.mark_to_market(bars[d])
             prev_equity = equity
             days_since_fit += 1
@@ -289,11 +315,13 @@ class PaperTrader:
 # ── CLI ────────────────────────────────────────────────────────────────
 
 
-def _cron_line(state_dir: str, pool: str) -> str:
+def _cron_line(state_dir: str, pool: str, export_dir: Optional[str] = None) -> str:
     cwd = os.getcwd()
-    return (f"35 15 * * 1-5 cd {cwd} && python -m alftrade.paper "
-            f"--pool {pool} --state-dir {state_dir} "
-            f">> {state_dir}/paper.log 2>&1")
+    line = (f"35 15 * * 1-5 cd {cwd} && python -m alftrade.paper "
+            f"--pool {pool} --state-dir {state_dir}")
+    if export_dir:
+        line += f" --export-dir {export_dir}"
+    return line + f" >> {state_dir}/paper.log 2>&1"
 
 
 def _install_cron(line: str) -> None:
@@ -336,6 +364,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="Execution timing (open auction / closing auction / "
                          "day VWAP). Can differ run-to-run; pending orders "
                          "execute under the run's timing.")
+    ap.add_argument("--export-dir", default=None,
+                    help="Export each close-time plan as ptrade order files "
+                         "under <dir>/<YYYYMMDD>/ (orders.csv/.json + "
+                         "target_positions.csv). The shadow simulation keeps "
+                         "running as usual.")
     ap.add_argument("--show-cron", action="store_true",
                     help="Print a crontab line for daily runs")
     ap.add_argument("--install-cron", action="store_true",
@@ -343,7 +376,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.show_cron or args.install_cron:
-        line = _cron_line(args.state_dir, args.pool)
+        line = _cron_line(args.state_dir, args.pool, args.export_dir)
         if args.install_cron:
             _install_cron(line)
         else:
@@ -361,6 +394,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         warmup_days=args.warmup_days,
         refit_days=args.refit_days,
         execution=ExecutionConfig(execution_timing=args.timing),
+        export_dir=args.export_dir,
     )
     updater = RealDataUpdater(args.data_root, symbols, args.start_date,
                               args.end_date)

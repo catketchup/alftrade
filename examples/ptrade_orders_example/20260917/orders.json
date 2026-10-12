@@ -1,0 +1,90 @@
+{
+ "generated_at": "2026-09-19T13:44:41",
+ "plan_date": 20260917,
+ "exec_date": 20260918,
+ "orders": [
+  {
+   "plan_date": 20260917,
+   "exec_date": 20260918,
+   "symbol": "600519.SH",
+   "name": "贵州茅台",
+   "side": "BUY",
+   "quantity": 100,
+   "order_type": "market",
+   "ref_close": 1573.05,
+   "est_notional": 157305.0,
+   "note": "REBALANCE"
+  },
+  {
+   "plan_date": 20260917,
+   "exec_date": 20260918,
+   "symbol": "000858.SZ",
+   "name": "五 粮 液",
+   "side": "BUY",
+   "quantity": 400,
+   "order_type": "market",
+   "ref_close": 131.8,
+   "est_notional": 52720.0,
+   "note": "REBALANCE"
+  },
+  {
+   "plan_date": 20260917,
+   "exec_date": 20260918,
+   "symbol": "600809.SH",
+   "name": "山西汾酒",
+   "side": "BUY",
+   "quantity": 500,
+   "order_type": "market",
+   "ref_close": 176.42,
+   "est_notional": 88210.0,
+   "note": "SIGNAL"
+  },
+  {
+   "plan_date": 20260917,
+   "exec_date": 20260918,
+   "symbol": "000568.SZ",
+   "name": "泸州老窖",
+   "side": "SELL",
+   "quantity": 200,
+   "order_type": "market",
+   "ref_close": 138.66,
+   "est_notional": 27732.0,
+   "note": "REBALANCE"
+  },
+  {
+   "plan_date": 20260917,
+   "exec_date": 20260918,
+   "symbol": "002304.SZ",
+   "name": "洋河股份",
+   "side": "SELL",
+   "quantity": 300,
+   "order_type": "market",
+   "ref_close": 88.35,
+   "est_notional": 26505.0,
+   "note": "STOP_LOSS"
+  }
+ ],
+ "targets": {
+  "cash": -198.0,
+  "positions": [
+   {
+    "symbol": "000858.SZ",
+    "name": "五 粮 液",
+    "target_qty": 400,
+    "est_value": 52720.0
+   },
+   {
+    "symbol": "600519.SH",
+    "name": "贵州茅台",
+    "target_qty": 300,
+    "est_value": 471915.0
+   },
+   {
+    "symbol": "600809.SH",
+    "name": "山西汾酒",
+    "target_qty": 500,
+    "est_value": 88210.0
+   }
+  ]
+ }
+}

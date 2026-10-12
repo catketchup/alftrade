@@ -56,8 +56,8 @@ from alftrade.store import (
 from alftrade.ingest import ingest_parquet, ingest_akshare, limit_pct_for_symbol
 from alftrade.datasource import (
     load_simulated, load_real, load_panel, fetch_daily_to_parquet,
-    csi300_symbols, industry_symbols, market_cap_symbols, resolve_symbols,
-    pool_label, symbol_names,
+    csi300_symbols, industry_symbols, market_cap_symbols, valuation_symbols,
+    resolve_symbols, pool_label, symbol_names,
     DEFAULT_SIMULATED_ROOT,
 )
 
@@ -118,6 +118,7 @@ __all__ = [
     "csi300_symbols",
     "industry_symbols",
     "market_cap_symbols",
+    "valuation_symbols",
     "resolve_symbols",
     "pool_label",
     "symbol_names",
